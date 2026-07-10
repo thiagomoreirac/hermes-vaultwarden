@@ -47,6 +47,9 @@ lets you pick the vault item, test-fetches it, and enables everything.
 
 Secrets are read from **one vault item's custom fields** — name each
 field after the env var it should set (e.g. `OPENROUTER_API_KEY`).
+The item's structural `login.username` / `login.password` / `notes`
+are not custom fields and are ignored unless you opt in via
+`username_env` / `password_env` / `notes_env` (see Config below).
 
 ## Commands
 
@@ -64,6 +67,9 @@ field after the env var it should set (e.g. `OPENROUTER_API_KEY`).
 | `enabled` | `false` | Master switch |
 | `session_env` | `BW_SESSION` | Env var holding the `bw unlock --raw` token |
 | `item_name` | — | Vault item whose custom fields become env vars |
+| `username_env` | — | Env var for `login.username`; unset = not exported |
+| `password_env` | — | Env var for `login.password`; unset = not exported |
+| `notes_env` | — | Env var for the item's `notes`; unset = not exported |
 | `override_existing` | `false` | Overwrite vars already set by `.env`/shell (never another secret source) |
 | `cache_ttl_seconds` | `300` | TTL for both cache layers; `0` disables caching entirely |
 | `binary_path` | — | Pin an exact `bw` binary path |
@@ -77,6 +83,11 @@ existing config keeps working unchanged.
 - **Bulk source**: all custom fields of the item are offered implicitly.
   Explicit mapped bindings (e.g. 1Password `env:` entries) outrank them
   on contested vars; conflicts are warned, never silently clobbered.
+- **Login/notes bindings**: `username_env`/`password_env`/`notes_env`
+  are opt-in — there's no default name to guess a structural field
+  into, so unset means not exported. If a binding's target name also
+  matches a custom field, the login/notes value wins and a warning is
+  emitted.
 - The session token env var is **protected** — a vault field named
   `BW_SESSION` can never overwrite the credential used to reach the vault.
 - **Timing**: plugin secret sources are discovered *after* the very

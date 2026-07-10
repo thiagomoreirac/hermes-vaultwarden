@@ -37,6 +37,12 @@ _FAKE_ITEM = {
     ],
 }
 
+_FAKE_LOGIN_ITEM = {
+    **_FAKE_ITEM,
+    "login": {"username": "svc-hermes", "password": "hunter2"},
+    "notes": "rotate quarterly",
+}
+
 _FAKE_SESSION = "fake-session-token-abc123"
 
 
@@ -282,6 +288,90 @@ class TestFetchVaultwardenSecrets:
                     home_path=tmp_path,
                 )
 
+    def test_login_bindings_opt_in(self, tmp_path):
+        with mock.patch("subprocess.run", return_value=_make_ok_proc(_FAKE_LOGIN_ITEM)):
+            secrets, warnings = vw.fetch_vaultwarden_secrets(
+                session=_FAKE_SESSION,
+                item_name="Hermes",
+                binary=Path("/usr/bin/bw"),
+                use_cache=False,
+                home_path=tmp_path,
+                username_env="SVC_USER",
+                password_env="SVC_PASSWORD",
+                notes_env="SVC_NOTES",
+            )
+        assert secrets["SVC_USER"] == "svc-hermes"
+        assert secrets["SVC_PASSWORD"] == "hunter2"
+        assert secrets["SVC_NOTES"] == "rotate quarterly"
+        assert secrets["OPENROUTER_API_KEY"] == "sk-or-test"
+        assert not any("SVC_" in w for w in warnings)
+
+    def test_login_bindings_default_off(self, tmp_path):
+        with mock.patch("subprocess.run", return_value=_make_ok_proc(_FAKE_LOGIN_ITEM)):
+            secrets, _ = vw.fetch_vaultwarden_secrets(
+                session=_FAKE_SESSION,
+                item_name="Hermes",
+                binary=Path("/usr/bin/bw"),
+                use_cache=False,
+                home_path=tmp_path,
+            )
+        assert "SVC_USER" not in secrets
+        assert "hunter2" not in secrets.values()
+
+    def test_login_binding_missing_value_warns(self, tmp_path):
+        item = {**_FAKE_ITEM, "login": {}, "notes": ""}
+        with mock.patch("subprocess.run", return_value=_make_ok_proc(item)):
+            secrets, warnings = vw.fetch_vaultwarden_secrets(
+                session=_FAKE_SESSION,
+                item_name="Hermes",
+                binary=Path("/usr/bin/bw"),
+                use_cache=False,
+                home_path=tmp_path,
+                username_env="SVC_USER",
+                notes_env="SVC_NOTES",
+            )
+        assert "SVC_USER" not in secrets
+        assert any("login.username" in w for w in warnings)
+        assert any("notes" in w for w in warnings)
+
+    def test_login_binding_collision_with_custom_field_warns(self, tmp_path):
+        item = {
+            **_FAKE_ITEM,
+            "fields": [{"name": "SVC_USER", "value": "from-field", "type": 1}],
+            "login": {"username": "from-login"},
+        }
+        with mock.patch("subprocess.run", return_value=_make_ok_proc(item)):
+            secrets, warnings = vw.fetch_vaultwarden_secrets(
+                session=_FAKE_SESSION,
+                item_name="Hermes",
+                binary=Path("/usr/bin/bw"),
+                use_cache=False,
+                home_path=tmp_path,
+                username_env="SVC_USER",
+            )
+        assert secrets["SVC_USER"] == "from-login"
+        assert any("both a custom field" in w for w in warnings)
+
+    def test_cache_key_distinguishes_login_bindings(self, tmp_path):
+        with mock.patch("subprocess.run", return_value=_make_ok_proc(_FAKE_LOGIN_ITEM)) as mock_run:
+            vw.fetch_vaultwarden_secrets(
+                session=_FAKE_SESSION,
+                item_name="Hermes",
+                binary=Path("/usr/bin/bw"),
+                use_cache=True,
+                home_path=tmp_path,
+            )
+            secrets, _ = vw.fetch_vaultwarden_secrets(
+                session=_FAKE_SESSION,
+                item_name="Hermes",
+                binary=Path("/usr/bin/bw"),
+                use_cache=True,
+                home_path=tmp_path,
+                username_env="SVC_USER",
+            )
+        assert mock_run.call_count == 2
+        assert secrets["SVC_USER"] == "svc-hermes"
+
     def test_timeout_raises_runtime_error(self, tmp_path):
         with mock.patch(
             "subprocess.run", side_effect=subprocess.TimeoutExpired("bw", 30)
@@ -363,6 +453,40 @@ class TestVaultwardenSourceFetch:
         import os
 
         assert "OPENROUTER_API_KEY" not in os.environ
+
+    def test_login_bindings_exported_via_config(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("BW_SESSION", _FAKE_SESSION)
+        monkeypatch.setattr(vw, "find_bw", lambda *a, **k: Path("/usr/bin/bw"))
+        with mock.patch("subprocess.run", return_value=_make_ok_proc(_FAKE_LOGIN_ITEM)):
+            result = self.source.fetch(
+                {
+                    "enabled": True,
+                    "item_name": "Hermes",
+                    "username_env": "SVC_USER",
+                    "password_env": "SVC_PASSWORD",
+                },
+                tmp_path,
+            )
+        assert result.ok
+        assert result.secrets["SVC_USER"] == "svc-hermes"
+        assert result.secrets["SVC_PASSWORD"] == "hunter2"
+        assert "SVC_NOTES" not in result.secrets
+
+    def test_invalid_login_binding_name_warns_and_is_ignored(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("BW_SESSION", _FAKE_SESSION)
+        monkeypatch.setattr(vw, "find_bw", lambda *a, **k: Path("/usr/bin/bw"))
+        with mock.patch("subprocess.run", return_value=_make_ok_proc(_FAKE_LOGIN_ITEM)):
+            result = self.source.fetch(
+                {
+                    "enabled": True,
+                    "item_name": "Hermes",
+                    "username_env": "not a name",
+                },
+                tmp_path,
+            )
+        assert result.ok
+        assert "not a name" not in result.secrets
+        assert any("not a valid" in w for w in result.warnings)
 
     def test_protected_env_vars_follows_config(self):
         assert self.source.protected_env_vars({}) == frozenset({"BW_SESSION"})

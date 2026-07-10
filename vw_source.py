@@ -16,12 +16,16 @@ Design summary
 * The session token is stored in ``~/.hermes/.env`` as ``BW_SESSION``
   (or the name chosen in ``secrets.vaultwarden.session_env``).  Obtain it
   with ``export BW_SESSION=$(bw unlock --raw)`` after logging in.
-* Secrets come from a single named vault item's custom fields::
+* Secrets come from a single named vault item::
 
       bw get item -- "<item_name>"     (BW_SESSION passed via child env)
 
-  Every field whose name is a valid env-var identifier is offered to the
-  orchestrator; :meth:`VaultwardenSource.fetch` never writes
+  Every custom field whose name is a valid env-var identifier is offered
+  to the orchestrator.  The item's structural ``login.username``,
+  ``login.password`` and ``notes`` are *not* custom fields and are only
+  exported when the user opts in via ``username_env`` / ``password_env``
+  / ``notes_env`` — there's no default name to guess, so silence beats a
+  wrong guess.  :meth:`VaultwardenSource.fetch` never writes
   ``os.environ`` itself.
 * Caching: two-layer (in-process dict + disk JSON via the shared
   :class:`agent.secret_sources._cache.DiskCache` substrate), written to
@@ -62,12 +66,14 @@ _DEFAULT_CACHE_TTL = 300.0
 # silently talk to an empty vault.
 _BW_ALLOW_ENV = ("BITWARDENCLI_APPDATA_DIR",)
 
-_CacheKey = Tuple[str, str, str]  # (resolved_home, session_fingerprint, item_name)
+_CacheKey = Tuple[str, str, str, str, str, str]
+# (resolved_home, session_fingerprint, item_name,
+#  username_env, password_env, notes_env)
 
 
 def _cache_key_str(cache_key: _CacheKey) -> str:
-    _home, session_fp, item_name = cache_key
-    return f"vw|{session_fp}|{item_name}"
+    _home, session_fp, item_name, username_env, password_env, notes_env = cache_key
+    return f"vw|{session_fp}|{item_name}|{username_env}|{password_env}|{notes_env}"
 
 
 _CACHE: Dict[_CacheKey, CachedFetch] = {}
@@ -135,8 +141,16 @@ def fetch_vaultwarden_secrets(
     cache_ttl_seconds: float = _DEFAULT_CACHE_TTL,
     use_cache: bool = True,
     home_path: Optional[Path] = None,
+    username_env: Optional[str] = None,
+    password_env: Optional[str] = None,
+    notes_env: Optional[str] = None,
 ) -> Tuple[Dict[str, str], List[str]]:
-    """Pull custom fields from a vault item via ``bw get item``.
+    """Pull secrets from a vault item via ``bw get item``.
+
+    Every custom field becomes an env var.  ``login.username``,
+    ``login.password`` and ``notes`` are structural (not custom fields)
+    and are only included when the caller opts in via ``username_env`` /
+    ``password_env`` / ``notes_env`` — the target env-var name for each.
 
     Returns ``(secrets_dict, warnings_list)``.
 
@@ -152,6 +166,9 @@ def fetch_vaultwarden_secrets(
         str(resolve_cache_home(home_path)),
         _session_fingerprint(session),
         item_name,
+        username_env or "",
+        password_env or "",
+        notes_env or "",
     )
     if use_cache:
         cached = _CACHE.get(cache_key)
@@ -169,7 +186,14 @@ def fetch_vaultwarden_secrets(
             "https://github.com/bitwarden/clients/releases"
         )
 
-    secrets, warnings = _run_bw_get_item(bw, session, item_name)
+    secrets, warnings = _run_bw_get_item(
+        bw,
+        session,
+        item_name,
+        username_env=username_env,
+        password_env=password_env,
+        notes_env=notes_env,
+    )
     import time as _time
 
     entry = CachedFetch(secrets=secrets, fetched_at=_time.time())
@@ -180,7 +204,13 @@ def fetch_vaultwarden_secrets(
 
 
 def _run_bw_get_item(
-    bw: Path, session: str, item_name: str
+    bw: Path,
+    session: str,
+    item_name: str,
+    *,
+    username_env: Optional[str] = None,
+    password_env: Optional[str] = None,
+    notes_env: Optional[str] = None,
 ) -> Tuple[Dict[str, str], List[str]]:
     # Session travels via the child env (bw reads BW_SESSION natively)
     # instead of a --session argv flag, keeping the token out of
@@ -211,12 +241,7 @@ def _run_bw_get_item(
 
     fields = item.get("fields") or []
     if not isinstance(fields, list):
-        return {}, ["item has no fields array"]
-    if not fields:
-        return {}, [
-            "item has no custom fields — add fields named after the env vars "
-            "you want to export"
-        ]
+        fields = []
 
     secrets: Dict[str, str] = {}
     warnings: List[str] = []
@@ -232,6 +257,33 @@ def _run_bw_get_item(
             warnings.append(f"Skipping field {name!r}: not a valid env-var name")
             continue
         secrets[name] = value
+
+    if not fields and not (username_env or password_env or notes_env):
+        return {}, [
+            "item has no custom fields — add fields named after the env vars "
+            "you want to export, or set username_env/password_env/notes_env "
+            "to pull the login/notes values instead"
+        ]
+
+    login = item.get("login")
+    login = login if isinstance(login, dict) else {}
+    for env_name, value, label in (
+        (username_env, login.get("username"), "login.username"),
+        (password_env, login.get("password"), "login.password"),
+        (notes_env, item.get("notes"), "notes"),
+    ):
+        if not env_name:
+            continue
+        if value is None or value == "":
+            warnings.append(f"item has no {label} to export as {env_name}")
+            continue
+        if env_name in secrets:
+            warnings.append(
+                f"{env_name} set by both a custom field and {label} — "
+                f"{label} wins"
+            )
+        secrets[env_name] = str(value)
+
     return secrets, warnings
 
 
@@ -299,6 +351,27 @@ class VaultwardenSource(SecretSource):
                 "description": "Vault item whose custom fields become env vars",
                 "default": "",
             },
+            "username_env": {
+                "description": (
+                    "Env var to export the item's login.username as.  "
+                    "Empty (default) means don't export it."
+                ),
+                "default": "",
+            },
+            "password_env": {
+                "description": (
+                    "Env var to export the item's login.password as.  "
+                    "Empty (default) means don't export it."
+                ),
+                "default": "",
+            },
+            "notes_env": {
+                "description": (
+                    "Env var to export the item's notes as.  "
+                    "Empty (default) means don't export it."
+                ),
+                "default": "",
+            },
             "override_existing": {
                 "description": (
                     "Overwrite env vars already set by .env / the shell.  "
@@ -357,6 +430,20 @@ class VaultwardenSource(SecretSource):
         except (TypeError, ValueError):
             ttl = _DEFAULT_CACHE_TTL
 
+        login_bindings: Dict[str, Optional[str]] = {}
+        for key in ("username_env", "password_env", "notes_env"):
+            raw = str(cfg.get(key) or "").strip()
+            if not raw:
+                login_bindings[key] = None
+            elif is_valid_env_name(raw):
+                login_bindings[key] = raw
+            else:
+                login_bindings[key] = None
+                result.warnings.append(
+                    f"secrets.vaultwarden.{key} {raw!r} is not a valid "
+                    "env-var name — ignoring it"
+                )
+
         try:
             secrets, warnings = fetch_vaultwarden_secrets(
                 session=session,
@@ -364,6 +451,9 @@ class VaultwardenSource(SecretSource):
                 binary=binary,
                 cache_ttl_seconds=ttl,
                 home_path=home_path,
+                username_env=login_bindings["username_env"],
+                password_env=login_bindings["password_env"],
+                notes_env=login_bindings["notes_env"],
             )
         except RuntimeError as exc:
             result.error = str(exc)

@@ -1,0 +1,540 @@
+"""Hermetic tests for the Vaultwarden secret-source plugin.
+
+We never hit a real vault — subprocess is mocked so the suite stays
+fast and offline-safe.
+"""
+
+from __future__ import annotations
+
+import json
+import subprocess
+import time
+from pathlib import Path
+from unittest import mock
+
+import pytest
+
+from agent.secret_sources.base import ErrorKind
+from agent.secret_sources import registry
+
+import vw_source as vw
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+_FAKE_ITEM = {
+    "object": "item",
+    "id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+    "name": "Hermes",
+    "type": 1,
+    "fields": [
+        {"name": "OPENROUTER_API_KEY", "value": "sk-or-test", "type": 1},
+        {"name": "ANTHROPIC_API_KEY", "value": "sk-ant-test", "type": 1},
+        {"name": "123INVALID", "value": "should-be-skipped", "type": 0},
+        {"name": "", "value": "also-skipped", "type": 0},
+    ],
+}
+
+_FAKE_SESSION = "fake-session-token-abc123"
+
+
+def _make_ok_proc(payload=None) -> mock.MagicMock:
+    proc = mock.MagicMock()
+    proc.returncode = 0
+    proc.stdout = json.dumps(payload if payload is not None else _FAKE_ITEM)
+    proc.stderr = ""
+    return proc
+
+
+def _make_fail_proc(returncode=1, stderr="error msg") -> mock.MagicMock:
+    proc = mock.MagicMock()
+    proc.returncode = returncode
+    proc.stdout = ""
+    proc.stderr = stderr
+    return proc
+
+
+# ---------------------------------------------------------------------------
+# find_bw
+# ---------------------------------------------------------------------------
+
+
+class TestFindBw:
+    def test_finds_system_bw(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(vw.shutil, "which", lambda _: "/usr/bin/bw")
+        monkeypatch.setattr(vw, "_hermes_bin_dir", lambda: tmp_path / "bin")
+        result = vw.find_bw()
+        assert result == Path("/usr/bin/bw")
+
+    def test_managed_bin_wins_over_system(self, tmp_path, monkeypatch):
+        managed = tmp_path / "bin" / "bw"
+        managed.parent.mkdir(parents=True)
+        managed.write_text("#!/bin/sh\necho fake")
+        managed.chmod(0o755)
+        monkeypatch.setattr(vw, "_hermes_bin_dir", lambda: tmp_path / "bin")
+        monkeypatch.setattr(vw.shutil, "which", lambda _: "/usr/bin/bw")
+        result = vw.find_bw()
+        assert result == managed
+
+    def test_returns_none_when_not_found(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(vw, "_hermes_bin_dir", lambda: tmp_path / "bin")
+        monkeypatch.setattr(vw.shutil, "which", lambda _: None)
+        assert vw.find_bw() is None
+
+    def test_pinned_path_wins(self, tmp_path, monkeypatch):
+        pinned = tmp_path / "custom-bw"
+        pinned.write_text("#!/bin/sh\necho fake")
+        pinned.chmod(0o755)
+        monkeypatch.setattr(vw.shutil, "which", lambda _: "/usr/bin/bw")
+        assert vw.find_bw(str(pinned)) == pinned
+
+    def test_broken_pin_returns_none_without_fallback(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(vw.shutil, "which", lambda _: "/usr/bin/bw")
+        assert vw.find_bw(str(tmp_path / "does-not-exist")) is None
+
+
+# ---------------------------------------------------------------------------
+# is_valid_env_name (shared helper from base — regression sanity)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "name, expected",
+    [
+        ("OPENROUTER_API_KEY", True),
+        ("_PRIVATE", True),
+        ("MY_VAR_123", True),
+        ("123INVALID", False),
+        ("", False),
+        ("has space", False),
+        ("has-dash", False),
+    ],
+)
+def test_is_valid_env_name(name, expected):
+    assert vw.is_valid_env_name(name) is expected
+
+
+# ---------------------------------------------------------------------------
+# fetch_vaultwarden_secrets
+# ---------------------------------------------------------------------------
+
+
+class TestFetchVaultwardenSecrets:
+    def setup_method(self):
+        vw._CACHE.clear()
+
+    def test_returns_parsed_fields(self, tmp_path):
+        with mock.patch("subprocess.run", return_value=_make_ok_proc()):
+            secrets, warnings = vw.fetch_vaultwarden_secrets(
+                session=_FAKE_SESSION,
+                item_name="Hermes",
+                binary=Path("/usr/bin/bw"),
+                use_cache=False,
+                home_path=tmp_path,
+            )
+        assert secrets["OPENROUTER_API_KEY"] == "sk-or-test"
+        assert secrets["ANTHROPIC_API_KEY"] == "sk-ant-test"
+        assert "123INVALID" not in secrets
+        assert any("123INVALID" in w for w in warnings)
+
+    def test_child_env_is_minimal_and_session_not_in_argv(self, tmp_path):
+        with mock.patch("subprocess.run", return_value=_make_ok_proc()) as mock_run:
+            vw.fetch_vaultwarden_secrets(
+                session=_FAKE_SESSION,
+                item_name="Hermes",
+                binary=Path("/usr/bin/bw"),
+                use_cache=False,
+                home_path=tmp_path,
+            )
+        argv = mock_run.call_args.args[0]
+        assert "--session" not in argv
+        assert _FAKE_SESSION not in argv
+        assert argv[-2:] == ["--", "Hermes"]
+        child_env = mock_run.call_args.kwargs["env"]
+        assert child_env["BW_SESSION"] == _FAKE_SESSION
+        # allowlisted env only — no wholesale os.environ copy
+        assert "HERMES_TEST_CANARY" not in child_env
+
+    def test_raises_on_empty_session(self):
+        with pytest.raises(RuntimeError, match="session token is empty"):
+            vw.fetch_vaultwarden_secrets(
+                session="",
+                item_name="Hermes",
+                binary=Path("/usr/bin/bw"),
+                use_cache=False,
+            )
+
+    def test_raises_on_empty_item_name(self):
+        with pytest.raises(RuntimeError, match="item_name is empty"):
+            vw.fetch_vaultwarden_secrets(
+                session=_FAKE_SESSION,
+                item_name="",
+                binary=Path("/usr/bin/bw"),
+                use_cache=False,
+            )
+
+    def test_raises_when_bw_fails(self, tmp_path):
+        with mock.patch("subprocess.run", return_value=_make_fail_proc(1, "Not logged in")):
+            with pytest.raises(RuntimeError, match="bw exited 1"):
+                vw.fetch_vaultwarden_secrets(
+                    session=_FAKE_SESSION,
+                    item_name="Hermes",
+                    binary=Path("/usr/bin/bw"),
+                    use_cache=False,
+                    home_path=tmp_path,
+                )
+
+    def test_raises_when_bw_not_found(self, monkeypatch):
+        monkeypatch.setattr(vw, "find_bw", lambda *a, **k: None)
+        with pytest.raises(RuntimeError, match="bw binary not found"):
+            vw.fetch_vaultwarden_secrets(
+                session=_FAKE_SESSION,
+                item_name="Hermes",
+                binary=None,
+                use_cache=False,
+            )
+
+    def test_in_process_cache_prevents_second_subprocess_call(self, tmp_path):
+        with mock.patch("subprocess.run", return_value=_make_ok_proc()) as mock_run:
+            for _ in range(2):
+                vw.fetch_vaultwarden_secrets(
+                    session=_FAKE_SESSION,
+                    item_name="Hermes",
+                    binary=Path("/usr/bin/bw"),
+                    use_cache=True,
+                    home_path=tmp_path,
+                )
+        assert mock_run.call_count == 1
+
+    def test_disk_cache_survives_process_cache_clear(self, tmp_path):
+        with mock.patch("subprocess.run", return_value=_make_ok_proc()) as mock_run:
+            vw.fetch_vaultwarden_secrets(
+                session=_FAKE_SESSION,
+                item_name="Hermes",
+                binary=Path("/usr/bin/bw"),
+                use_cache=True,
+                home_path=tmp_path,
+            )
+            vw._CACHE.clear()
+            secrets, _ = vw.fetch_vaultwarden_secrets(
+                session=_FAKE_SESSION,
+                item_name="Hermes",
+                binary=Path("/usr/bin/bw"),
+                use_cache=True,
+                home_path=tmp_path,
+            )
+        assert mock_run.call_count == 1
+        assert "OPENROUTER_API_KEY" in secrets
+
+    def test_expired_disk_cache_triggers_refetch(self, tmp_path):
+        with mock.patch("subprocess.run", return_value=_make_ok_proc()) as mock_run:
+            vw.fetch_vaultwarden_secrets(
+                session=_FAKE_SESSION,
+                item_name="Hermes",
+                binary=Path("/usr/bin/bw"),
+                cache_ttl_seconds=1,
+                use_cache=True,
+                home_path=tmp_path,
+            )
+            vw._CACHE.clear()
+            cache_file = vw._disk_cache_path(tmp_path)
+            payload = json.loads(cache_file.read_text())
+            payload["fetched_at"] = time.time() - 10
+            cache_file.write_text(json.dumps(payload))
+
+            vw.fetch_vaultwarden_secrets(
+                session=_FAKE_SESSION,
+                item_name="Hermes",
+                binary=Path("/usr/bin/bw"),
+                cache_ttl_seconds=1,
+                use_cache=True,
+                home_path=tmp_path,
+            )
+        assert mock_run.call_count == 2
+
+    def test_item_with_no_fields_returns_empty_with_warning(self, tmp_path):
+        item = {**_FAKE_ITEM, "fields": []}
+        with mock.patch("subprocess.run", return_value=_make_ok_proc(item)):
+            secrets, warnings = vw.fetch_vaultwarden_secrets(
+                session=_FAKE_SESSION,
+                item_name="Hermes",
+                binary=Path("/usr/bin/bw"),
+                use_cache=False,
+                home_path=tmp_path,
+            )
+        assert secrets == {}
+        assert any("fields" in w for w in warnings)
+
+    def test_raises_on_non_json_output(self, tmp_path):
+        proc = mock.MagicMock()
+        proc.returncode = 0
+        proc.stdout = "not json"
+        proc.stderr = ""
+        with mock.patch("subprocess.run", return_value=proc):
+            with pytest.raises(RuntimeError, match="non-JSON"):
+                vw.fetch_vaultwarden_secrets(
+                    session=_FAKE_SESSION,
+                    item_name="Hermes",
+                    binary=Path("/usr/bin/bw"),
+                    use_cache=False,
+                    home_path=tmp_path,
+                )
+
+    def test_timeout_raises_runtime_error(self, tmp_path):
+        with mock.patch(
+            "subprocess.run", side_effect=subprocess.TimeoutExpired("bw", 30)
+        ):
+            with pytest.raises(RuntimeError, match="timed out"):
+                vw.fetch_vaultwarden_secrets(
+                    session=_FAKE_SESSION,
+                    item_name="Hermes",
+                    binary=Path("/usr/bin/bw"),
+                    use_cache=False,
+                    home_path=tmp_path,
+                )
+
+
+# ---------------------------------------------------------------------------
+# VaultwardenSource.fetch — the SecretSource contract surface
+# ---------------------------------------------------------------------------
+
+
+class TestVaultwardenSourceFetch:
+    def setup_method(self):
+        vw._CACHE.clear()
+        self.source = vw.VaultwardenSource()
+
+    def test_disabled_by_default(self):
+        assert self.source.is_enabled({}) is False
+        assert self.source.is_enabled({"enabled": False}) is False
+
+    def test_missing_session_env_reports_not_configured(self, monkeypatch):
+        monkeypatch.delenv("BW_SESSION", raising=False)
+        result = self.source.fetch({"enabled": True, "item_name": "Hermes"}, Path("/tmp"))
+        assert not result.ok
+        assert "BW_SESSION" in result.error
+        assert result.error_kind is ErrorKind.NOT_CONFIGURED
+        assert result.secrets == {}
+
+    def test_missing_item_name_reports_not_configured(self, monkeypatch):
+        monkeypatch.setenv("BW_SESSION", _FAKE_SESSION)
+        result = self.source.fetch({"enabled": True}, Path("/tmp"))
+        assert not result.ok
+        assert "item_name" in result.error
+        assert result.error_kind is ErrorKind.NOT_CONFIGURED
+
+    def test_missing_binary_reports_binary_missing(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("BW_SESSION", _FAKE_SESSION)
+        monkeypatch.setattr(vw, "find_bw", lambda *a, **k: None)
+        result = self.source.fetch(
+            {"enabled": True, "item_name": "Hermes"}, tmp_path
+        )
+        assert not result.ok
+        assert "not found" in result.error
+        assert result.error_kind is ErrorKind.BINARY_MISSING
+
+    def test_fetch_error_classified(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("BW_SESSION", _FAKE_SESSION)
+        monkeypatch.setattr(vw, "find_bw", lambda *a, **k: Path("/usr/bin/bw"))
+        with mock.patch(
+            "subprocess.run", return_value=_make_fail_proc(1, "Session expired")
+        ):
+            result = self.source.fetch(
+                {"enabled": True, "item_name": "Hermes"}, tmp_path
+            )
+        assert not result.ok
+        assert "Session expired" in result.error
+        assert result.error_kind is ErrorKind.AUTH_EXPIRED
+
+    def test_fetch_returns_secrets_without_touching_environ(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("BW_SESSION", _FAKE_SESSION)
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        monkeypatch.setattr(vw, "find_bw", lambda *a, **k: Path("/usr/bin/bw"))
+        with mock.patch("subprocess.run", return_value=_make_ok_proc()):
+            result = self.source.fetch(
+                {"enabled": True, "item_name": "Hermes"}, tmp_path
+            )
+        assert result.ok
+        assert result.secrets["OPENROUTER_API_KEY"] == "sk-or-test"
+        import os
+
+        assert "OPENROUTER_API_KEY" not in os.environ
+
+    def test_protected_env_vars_follows_config(self):
+        assert self.source.protected_env_vars({}) == frozenset({"BW_SESSION"})
+        assert self.source.protected_env_vars(
+            {"session_env": "MY_BW_TOKEN"}
+        ) == frozenset({"MY_BW_TOKEN"})
+        # invalid name falls back to the default rather than exporting junk
+        assert self.source.protected_env_vars(
+            {"session_env": "not a name"}
+        ) == frozenset({"BW_SESSION"})
+
+    def test_override_existing_defaults_false(self):
+        assert self.source.override_existing({}) is False
+        assert self.source.override_existing({"override_existing": True}) is True
+
+
+@pytest.mark.parametrize(
+    "message, expected",
+    [
+        ("bw timed out after 30s", ErrorKind.TIMEOUT),
+        ("failed to invoke bw: No such file", ErrorKind.BINARY_MISSING),
+        ("bw exited 1: Session expired", ErrorKind.AUTH_EXPIRED),
+        ("bw exited 1: Vault is locked.", ErrorKind.AUTH_EXPIRED),
+        ("bw exited 1: You are not logged in.", ErrorKind.AUTH_EXPIRED),
+        ("bw exited 1: Not found.", ErrorKind.REF_INVALID),
+        ("bw exited 1: connection refused", ErrorKind.NETWORK),
+        ("bw returned non-JSON output: x", ErrorKind.INTERNAL),
+    ],
+)
+def test_classify_bw_error(message, expected):
+    assert vw._classify_bw_error(message) is expected
+
+
+# ---------------------------------------------------------------------------
+# Orchestrator round-trip — apply semantics now live in registry.apply_all
+# ---------------------------------------------------------------------------
+
+
+class TestOrchestratedApply:
+    def setup_method(self):
+        vw._CACHE.clear()
+        registry._reset_registry_for_tests()
+        registry.register_source(vw.VaultwardenSource())
+
+    def teardown_method(self):
+        registry._reset_registry_for_tests()
+
+    def _apply(self, tmp_path, environ, cfg_extra=None):
+        cfg = {"enabled": True, "item_name": "Hermes", **(cfg_extra or {})}
+        return registry.apply_all({"vaultwarden": cfg}, tmp_path, environ=environ)
+
+    def test_applies_new_secrets(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("BW_SESSION", _FAKE_SESSION)
+        monkeypatch.setattr(vw, "find_bw", lambda *a, **k: Path("/usr/bin/bw"))
+        environ = {}
+        with mock.patch("subprocess.run", return_value=_make_ok_proc()):
+            report = self._apply(tmp_path, environ)
+        assert environ["OPENROUTER_API_KEY"] == "sk-or-test"
+        assert report.provenance["OPENROUTER_API_KEY"].source == "vaultwarden"
+        assert report.provenance["OPENROUTER_API_KEY"].shape == "bulk"
+
+    def test_skips_existing_when_override_false(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("BW_SESSION", _FAKE_SESSION)
+        monkeypatch.setattr(vw, "find_bw", lambda *a, **k: Path("/usr/bin/bw"))
+        environ = {"OPENROUTER_API_KEY": "existing-value"}
+        with mock.patch("subprocess.run", return_value=_make_ok_proc()):
+            report = self._apply(tmp_path, environ)
+        assert environ["OPENROUTER_API_KEY"] == "existing-value"
+        sr = report.sources[0]
+        assert "OPENROUTER_API_KEY" in sr.skipped_existing
+        assert "ANTHROPIC_API_KEY" in sr.applied
+
+    def test_overrides_existing_when_flag_set(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("BW_SESSION", _FAKE_SESSION)
+        monkeypatch.setattr(vw, "find_bw", lambda *a, **k: Path("/usr/bin/bw"))
+        environ = {"OPENROUTER_API_KEY": "old-value"}
+        with mock.patch("subprocess.run", return_value=_make_ok_proc()):
+            report = self._apply(
+                tmp_path, environ, cfg_extra={"override_existing": True}
+            )
+        assert environ["OPENROUTER_API_KEY"] == "sk-or-test"
+        assert report.provenance["OPENROUTER_API_KEY"].overrode_env is True
+
+    def test_session_env_itself_never_overwritten(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("BW_SESSION", _FAKE_SESSION)
+        monkeypatch.setattr(vw, "find_bw", lambda *a, **k: Path("/usr/bin/bw"))
+        item = {
+            **_FAKE_ITEM,
+            "fields": [
+                {"name": "BW_SESSION", "value": "should-not-apply", "type": 1},
+                {"name": "SOME_KEY", "value": "val", "type": 1},
+            ],
+        }
+        environ = {"BW_SESSION": _FAKE_SESSION}
+        with mock.patch("subprocess.run", return_value=_make_ok_proc(item)):
+            report = self._apply(
+                tmp_path, environ, cfg_extra={"override_existing": True}
+            )
+        assert environ["BW_SESSION"] == _FAKE_SESSION
+        sr = report.sources[0]
+        assert "BW_SESSION" in sr.skipped_protected
+        assert "SOME_KEY" in sr.applied
+
+    def test_fetch_error_does_not_break_pass(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("BW_SESSION", _FAKE_SESSION)
+        monkeypatch.setattr(vw, "find_bw", lambda *a, **k: Path("/usr/bin/bw"))
+        with mock.patch(
+            "subprocess.run", return_value=_make_fail_proc(1, "Session expired")
+        ):
+            report = self._apply(tmp_path, {})
+        assert not report.applied_any
+        assert not report.sources[0].result.ok
+
+
+# ---------------------------------------------------------------------------
+# Disk cache format
+# ---------------------------------------------------------------------------
+
+
+class TestDiskCache:
+    def setup_method(self):
+        vw._CACHE.clear()
+
+    def test_disk_cache_written_with_mode_0600(self, tmp_path):
+        with mock.patch("subprocess.run", return_value=_make_ok_proc()):
+            vw.fetch_vaultwarden_secrets(
+                session=_FAKE_SESSION,
+                item_name="Hermes",
+                binary=Path("/usr/bin/bw"),
+                use_cache=True,
+                home_path=tmp_path,
+            )
+        cache_path = vw._disk_cache_path(tmp_path)
+        assert cache_path.exists()
+        mode = cache_path.stat().st_mode & 0o777
+        assert mode == 0o600, f"Expected 0600, got {oct(mode)}"
+
+    def test_cache_key_prefixed_with_vw(self, tmp_path):
+        with mock.patch("subprocess.run", return_value=_make_ok_proc()):
+            vw.fetch_vaultwarden_secrets(
+                session=_FAKE_SESSION,
+                item_name="Hermes",
+                binary=Path("/usr/bin/bw"),
+                use_cache=True,
+                home_path=tmp_path,
+            )
+        payload = json.loads(vw._disk_cache_path(tmp_path).read_text())
+        assert payload["key"].startswith("vw|")
+        assert _FAKE_SESSION not in payload["key"]
+
+    def test_zero_ttl_writes_no_cache_file(self, tmp_path):
+        with mock.patch("subprocess.run", return_value=_make_ok_proc()):
+            vw.fetch_vaultwarden_secrets(
+                session=_FAKE_SESSION,
+                item_name="Hermes",
+                binary=Path("/usr/bin/bw"),
+                cache_ttl_seconds=0,
+                use_cache=True,
+                home_path=tmp_path,
+            )
+        assert not vw._disk_cache_path(tmp_path).exists()
+
+    def test_reset_cache_for_tests_clears_both_layers(self, tmp_path):
+        with mock.patch("subprocess.run", return_value=_make_ok_proc()):
+            vw.fetch_vaultwarden_secrets(
+                session=_FAKE_SESSION,
+                item_name="Hermes",
+                binary=Path("/usr/bin/bw"),
+                use_cache=True,
+                home_path=tmp_path,
+            )
+        assert vw._CACHE
+        vw._reset_cache_for_tests(tmp_path)
+        assert not vw._CACHE
+        assert not vw._disk_cache_path(tmp_path).exists()

@@ -1,0 +1,105 @@
+# hermes-vaultwarden
+
+Hermes Agent plugin: pull env vars from a **Vaultwarden** (or Bitwarden
+Password Manager) vault item's custom fields at process startup, via the
+`bw` CLI.
+
+Vaultwarden implements the Bitwarden *Password Manager* API — not
+*Secrets Manager* — so Hermes' bundled `secrets.bitwarden` source (which
+uses the `bws` CLI) does not work with self-hosted Vaultwarden
+instances.  This plugin bridges that gap as an external
+[`SecretSource`](https://github.com/NousResearch/hermes-agent) plugin
+(successor to in-tree PR
+[#42300](https://github.com/NousResearch/hermes-agent/pull/42300),
+reworked for the pluggable interface introduced in
+[#59498](https://github.com/NousResearch/hermes-agent/pull/59498)).
+
+## Install
+
+```bash
+git clone https://github.com/hansipie/hermes-vaultwarden ~/Code/hermes-vaultwarden
+ln -s ~/Code/hermes-vaultwarden ~/.hermes/plugins/vaultwarden
+```
+
+User plugins are **opt-in** — add the plugin to `plugins.enabled` in
+`~/.hermes/config.yaml` (the setup wizard does this for you):
+
+```yaml
+plugins:
+  enabled:
+    - vaultwarden
+```
+
+Install the `bw` CLI (not auto-installed): `npm install -g @bitwarden/cli`,
+snap, or the native binary from https://bitwarden.com/help/cli/.
+
+## Setup
+
+```bash
+bw config server https://your-vaultwarden.example.com
+bw login
+export BW_SESSION=$(bw unlock --raw)
+hermes vaultwarden setup
+```
+
+The wizard verifies `bw`, stores the session token in `~/.hermes/.env`,
+lets you pick the vault item, test-fetches it, and enables everything.
+
+Secrets are read from **one vault item's custom fields** — name each
+field after the env var it should set (e.g. `OPENROUTER_API_KEY`).
+
+## Commands
+
+| Command | What it does |
+|---|---|
+| `hermes vaultwarden setup` | Interactive wizard (flags: `--session`, `--item-name`, `--server-url` for non-TTY) |
+| `hermes vaultwarden status` | Config, binary, server, session presence |
+| `hermes vaultwarden sync` | `bw sync` + fresh fetch, dry-run table; `--apply` exports into the current process |
+| `hermes vaultwarden disable` | Flips `secrets.vaultwarden.enabled` to false and clears the disk cache |
+
+## Config (`secrets.vaultwarden.*` in config.yaml)
+
+| Key | Default | Meaning |
+|---|---|---|
+| `enabled` | `false` | Master switch |
+| `session_env` | `BW_SESSION` | Env var holding the `bw unlock --raw` token |
+| `item_name` | — | Vault item whose custom fields become env vars |
+| `override_existing` | `false` | Overwrite vars already set by `.env`/shell (never another secret source) |
+| `cache_ttl_seconds` | `300` | TTL for both cache layers; `0` disables caching entirely |
+| `binary_path` | — | Pin an exact `bw` binary path |
+| `timeout_seconds` | `120` | Orchestrator wall-clock budget around the fetch |
+
+Config keys are identical to the old in-tree PR #42300 branch — an
+existing config keeps working unchanged.
+
+## Behaviour & caveats
+
+- **Bulk source**: all custom fields of the item are offered implicitly.
+  Explicit mapped bindings (e.g. 1Password `env:` entries) outrank them
+  on contested vars; conflicts are warned, never silently clobbered.
+- The session token env var is **protected** — a vault field named
+  `BW_SESSION` can never overwrite the credential used to reach the vault.
+- **Timing**: plugin secret sources are discovered *after* the very
+  first env load of the process that discovers them.  They apply to every
+  Hermes process spawned afterwards (gateway children, cron sessions,
+  subagents).  For secrets the first interactive process itself needs,
+  use `hermes vaultwarden sync --apply` or keep them in `.env`.
+- Failures (missing binary, expired session, unknown item) never block
+  startup — they surface as one-line warnings with a machine-readable
+  error kind.
+- Cache: in-process dict + `~/.hermes/cache/vaultwarden_cache.json`
+  (atomic writes, mode `0600`, keyed on a session fingerprint — the
+  token itself is never written).  A stale `bw_cache.json` from the old
+  in-tree branch is dead weight and safe to delete.
+
+## Tests
+
+```bash
+HERMES_AGENT_SRC=~/Code/hermes-agent \
+  uv run --with pytest --with rich --with pyyaml pytest tests/ -v
+```
+
+`HERMES_AGENT_SRC` must point at a hermes-agent checkout that includes
+the `SecretSource` interface (post-#59498).  The suite is hermetic (no
+real vault, subprocess mocked) and includes the upstream
+`SecretSourceConformance` kit.

@@ -123,6 +123,43 @@ def test_is_valid_env_name(name, expected):
 
 
 # ---------------------------------------------------------------------------
+# resolve_login_bindings
+# ---------------------------------------------------------------------------
+
+
+class TestResolveLoginBindings:
+    def test_all_unset_by_default(self):
+        bindings, warnings = vw.resolve_login_bindings({})
+        assert bindings == {
+            "username_env": None,
+            "password_env": None,
+            "notes_env": None,
+        }
+        assert warnings == []
+
+    def test_valid_names_pass_through(self):
+        cfg = {
+            "username_env": "VW_USER",
+            "password_env": "VW_PASS",
+            "notes_env": "VW_NOTES",
+        }
+        bindings, warnings = vw.resolve_login_bindings(cfg)
+        assert bindings == cfg
+        assert warnings == []
+
+    def test_invalid_name_warns_and_resolves_to_none(self):
+        bindings, warnings = vw.resolve_login_bindings({"username_env": "bad name!"})
+        assert bindings["username_env"] is None
+        assert len(warnings) == 1
+        assert "username_env" in warnings[0]
+
+    def test_blank_and_whitespace_treated_as_unset(self):
+        bindings, warnings = vw.resolve_login_bindings({"password_env": "   "})
+        assert bindings["password_env"] is None
+        assert warnings == []
+
+
+# ---------------------------------------------------------------------------
 # fetch_vaultwarden_secrets
 # ---------------------------------------------------------------------------
 

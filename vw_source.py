@@ -313,6 +313,33 @@ def _classify_bw_error(message: str) -> ErrorKind:
     return ErrorKind.INTERNAL
 
 
+def resolve_login_bindings(
+    cfg: dict,
+) -> Tuple[Dict[str, Optional[str]], List[str]]:
+    """Validate cfg's username_env/password_env/notes_env.
+
+    Returns ``(bindings, warnings)``.  Empty/missing -> ``None`` (opt-out,
+    the default).  Non-empty but not a valid env-var name -> ``None`` plus
+    a warning — never raises; callers embed the warning into their own
+    reporting.
+    """
+    bindings: Dict[str, Optional[str]] = {}
+    warnings: List[str] = []
+    for key in ("username_env", "password_env", "notes_env"):
+        raw = str(cfg.get(key) or "").strip()
+        if not raw:
+            bindings[key] = None
+        elif is_valid_env_name(raw):
+            bindings[key] = raw
+        else:
+            bindings[key] = None
+            warnings.append(
+                f"secrets.vaultwarden.{key} {raw!r} is not a valid "
+                "env-var name — ignoring it"
+            )
+    return bindings, warnings
+
+
 # ---------------------------------------------------------------------------
 # The SecretSource — registered via PluginContext.register_secret_source()
 # ---------------------------------------------------------------------------
@@ -430,19 +457,8 @@ class VaultwardenSource(SecretSource):
         except (TypeError, ValueError):
             ttl = _DEFAULT_CACHE_TTL
 
-        login_bindings: Dict[str, Optional[str]] = {}
-        for key in ("username_env", "password_env", "notes_env"):
-            raw = str(cfg.get(key) or "").strip()
-            if not raw:
-                login_bindings[key] = None
-            elif is_valid_env_name(raw):
-                login_bindings[key] = raw
-            else:
-                login_bindings[key] = None
-                result.warnings.append(
-                    f"secrets.vaultwarden.{key} {raw!r} is not a valid "
-                    "env-var name — ignoring it"
-                )
+        login_bindings, binding_warnings = resolve_login_bindings(cfg)
+        result.warnings.extend(binding_warnings)
 
         try:
             secrets, warnings = fetch_vaultwarden_secrets(

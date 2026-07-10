@@ -72,6 +72,18 @@ def setup_parser(parser: argparse.ArgumentParser) -> None:
             "Skip to keep the current bw server configuration."
         ),
     )
+    setup.add_argument(
+        "--username-env",
+        help="Export the item's login.username under this env-var name (optional)",
+    )
+    setup.add_argument(
+        "--password-env",
+        help="Export the item's login.password under this env-var name (optional)",
+    )
+    setup.add_argument(
+        "--notes-env",
+        help="Export the item's notes under this env-var name (optional)",
+    )
     setup.set_defaults(func=cmd_setup)
 
     status = sub.add_parser("status", help="Show config + binary + session status")
@@ -243,6 +255,47 @@ def cmd_setup(args: argparse.Namespace) -> int:
                 break
             console.print(f"  [red]Out of range — pick 1-{len(items)}.[/red]")
 
+    # ------------------------------------------------------------------ login bindings
+    console.print()
+    console.print("[bold]Step 4b[/bold]  Optional: map login fields to env vars")
+    console.print(
+        "  Leave blank to skip.  These export the vault item's structural "
+        "login.username / login.password / notes fields — custom fields "
+        "remain the primary way to export secrets in bulk."
+    )
+
+    def _prompt_binding(
+        flag_value: Optional[str], label: str, arg_name: str
+    ) -> Optional[str]:
+        if flag_value and flag_value.strip():
+            candidate = flag_value.strip()
+            if not is_valid_env_name(candidate):
+                console.print(
+                    f"  [yellow]--{arg_name} {candidate!r} is not a valid "
+                    "env-var name — ignoring it.[/yellow]"
+                )
+                return None
+            return candidate
+        if not sys.stdin.isatty():
+            return None
+        while True:
+            raw = console.input(f"  {label} env var (blank = skip): ").strip()
+            if not raw:
+                return None
+            if is_valid_env_name(raw):
+                return raw
+            console.print(
+                f"  [red]{raw!r} is not a valid env-var name — try again.[/red]"
+            )
+
+    username_env = _prompt_binding(
+        args.username_env, "login.username ->", "username-env"
+    )
+    password_env = _prompt_binding(
+        args.password_env, "login.password ->", "password-env"
+    )
+    notes_env = _prompt_binding(args.notes_env, "notes ->", "notes-env")
+
     # ------------------------------------------------------------------ test
     console.print()
     console.print("[bold]Step 5[/bold]  Test fetch")
@@ -252,6 +305,9 @@ def cmd_setup(args: argparse.Namespace) -> int:
             item_name=item_name,
             binary=binary,
             use_cache=False,
+            username_env=username_env,
+            password_env=password_env,
+            notes_env=notes_env,
         )
     except Exception as exc:  # noqa: BLE001
         console.print(f"  [red]✗ Fetch failed: {exc}[/red]")
@@ -285,6 +341,16 @@ def cmd_setup(args: argparse.Namespace) -> int:
     secrets_cfg.setdefault("session_env", session_env)
     secrets_cfg.setdefault("cache_ttl_seconds", 300)
     secrets_cfg.setdefault("override_existing", True)
+
+    for key, value in (
+        ("username_env", username_env),
+        ("password_env", password_env),
+        ("notes_env", notes_env),
+    ):
+        if value:
+            secrets_cfg[key] = value
+        else:
+            secrets_cfg.pop(key, None)
 
     # User plugins are opt-in — make sure this one is allowed to load.
     plugins_cfg = cfg.setdefault("plugins", {})
@@ -330,6 +396,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     )
 
     binary = vw.find_bw(vw_cfg.get("binary_path"))
+    login_bindings, binding_warnings = vw.resolve_login_bindings(vw_cfg)
 
     table = Table(show_header=False, box=None, padding=(0, 2))
     table.add_column("", style="bold")
@@ -339,6 +406,9 @@ def cmd_status(args: argparse.Namespace) -> int:
     table.add_row("session_env",      session_env)
     table.add_row("session",          "[green]present[/green]" if session_set else "[red]missing[/red]")
     table.add_row("item",             item_name or "[dim](unset)[/dim]")
+    table.add_row("username_env",     login_bindings["username_env"] or "[dim](unset)[/dim]")
+    table.add_row("password_env",     login_bindings["password_env"] or "[dim](unset)[/dim]")
+    table.add_row("notes_env",        login_bindings["notes_env"] or "[dim](unset)[/dim]")
     table.add_row("Override existing", _yn(bool(vw_cfg.get("override_existing", False))))
     table.add_row("Cache TTL (s)",    str(vw_cfg.get("cache_ttl_seconds", 300)))
 
@@ -350,6 +420,8 @@ def cmd_status(args: argparse.Namespace) -> int:
         table.add_row("bw binary",   "[red]not found[/red]")
 
     console.print(Panel(table, title="Vaultwarden / Bitwarden PM", border_style="cyan"))
+    for w in binding_warnings:
+        console.print(f"  [yellow]warning:[/yellow] {w}")
 
     if not plugin_enabled:
         console.print(
@@ -392,6 +464,8 @@ def cmd_sync(args: argparse.Namespace) -> int:
         console.print("[red]No item_name configured.[/red]")
         return 1
 
+    login_bindings, binding_warnings = vw.resolve_login_bindings(vw_cfg)
+
     binary = vw.find_bw(vw_cfg.get("binary_path"))
     if binary is None:
         console.print("[red]bw binary not found.[/red]")
@@ -417,10 +491,17 @@ def cmd_sync(args: argparse.Namespace) -> int:
             item_name=item_name,
             binary=binary,
             use_cache=False,
+            username_env=login_bindings["username_env"],
+            password_env=login_bindings["password_env"],
+            notes_env=login_bindings["notes_env"],
         )
     except Exception as exc:  # noqa: BLE001
         console.print(f"[red]Fetch failed: {exc}[/red]")
         return 1
+
+    warnings = list(warnings) + binding_warnings
+    for w in warnings:
+        console.print(f"[yellow]warning:[/yellow] {w}")
 
     if not secrets:
         console.print("[yellow]No usable fields in vault item.[/yellow]")
@@ -447,8 +528,6 @@ def cmd_sync(args: argparse.Namespace) -> int:
             table.add_row(key, "[green]would export[/green]" + (" (overrides)" if already else ""))
 
     console.print(table)
-    for w in warnings:
-        console.print(f"[yellow]warning:[/yellow] {w}")
 
     if not args.apply:
         console.print(

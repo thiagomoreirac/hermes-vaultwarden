@@ -43,19 +43,24 @@ hermes vaultwarden setup
 ```
 
 The wizard verifies `bw`, stores the session token in `~/.hermes/.env`,
-lets you pick the vault item, test-fetches it, and enables everything.
+lets you pick the vault item, optionally maps `login.username` /
+`login.password` / `notes` to env vars, test-fetches it, and enables
+everything.
 
 Secrets are read from **one vault item's custom fields** — name each
 field after the env var it should set (e.g. `OPENROUTER_API_KEY`).
 The item's structural `login.username` / `login.password` / `notes`
-are not custom fields and are ignored unless you opt in via
-`username_env` / `password_env` / `notes_env` (see Config below).
+are not custom fields and are ignored unless you opt in — either
+answer the wizard's prompts (blank = skip) or pass
+`--username-env` / `--password-env` / `--notes-env` for non-interactive
+runs (see Config below). Re-running `setup` and leaving a binding blank
+clears it from `config.yaml`.
 
 ## Commands
 
 | Command | What it does |
 |---|---|
-| `hermes vaultwarden setup` | Interactive wizard (flags: `--session`, `--item-name`, `--server-url` for non-TTY) |
+| `hermes vaultwarden setup` | Interactive wizard (flags: `--session`, `--item-name`, `--server-url`, `--username-env`, `--password-env`, `--notes-env` for non-TTY) |
 | `hermes vaultwarden status` | Config, binary, server, session presence |
 | `hermes vaultwarden sync` | `bw sync` + fresh fetch, dry-run table; `--apply` exports into the current process |
 | `hermes vaultwarden disable` | Flips `secrets.vaultwarden.enabled` to false and clears the disk cache |

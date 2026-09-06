@@ -58,10 +58,11 @@ def setup_parser(parser: argparse.ArgumentParser) -> None:
         help="Vault item name to read secrets from (skips interactive prompt)",
     )
     setup.add_argument(
-        "--session",
+        "--session-stdin",
+        action="store_true",
         help=(
-            "Provide the BW_SESSION token non-interactively "
-            "(will be stored in .env)"
+            "Read the BW_SESSION token from stdin for non-interactive setup "
+            "(safer than passing it as an argv value)"
         ),
     )
     setup.add_argument(
@@ -83,6 +84,21 @@ def setup_parser(parser: argparse.ArgumentParser) -> None:
     setup.add_argument(
         "--notes-env",
         help="Export the item's notes under this env-var name (optional)",
+    )
+    setup.add_argument(
+        "--allow-env",
+        action="append",
+        dest="allowed_env_vars",
+        help=(
+            "Custom-field env var to allow; repeat or comma-separate. "
+            "Defaults to the safe fields discovered during setup."
+        ),
+    )
+    setup.add_argument(
+        "--override-existing",
+        action="store_true",
+        default=None,
+        help="Allow Vaultwarden values to overwrite existing env vars",
     )
     setup.set_defaults(func=cmd_setup)
 
@@ -146,12 +162,23 @@ def cmd_setup(args: argparse.Namespace) -> int:
     version = _bw_version(binary)
     console.print(f"  [green]✓[/green] {binary}  ({version})")
 
+    cfg = load_config()
+    secrets_cfg = (cfg.setdefault("secrets", {})
+                     .setdefault("vaultwarden", {}))
+    session_env = secrets_cfg.get("session_env", "BW_SESSION")
+
+    if args.session_stdin and not (args.item_name and args.item_name.strip()):
+        console.print(
+            "  [red]--session-stdin requires --item-name because stdin is "
+            "consumed by the session token.[/red]"
+        )
+        return 1
+
     # -- non-interactive guard --
     if not sys.stdin.isatty():
         missing = []
-        if not (args.session and args.session.strip()):
-            if not os.environ.get("BW_SESSION", "").strip():
-                missing.append("--session")
+        if not os.environ.get(session_env, "").strip() and not args.session_stdin:
+            missing.append(f"{session_env} env or --session-stdin")
         if not (args.item_name and args.item_name.strip()):
             missing.append("--item-name")
         if missing:
@@ -159,9 +186,8 @@ def cmd_setup(args: argparse.Namespace) -> int:
                 f"  [red]Non-interactive mode (no TTY) requires all setup flags.[/red]\n"
                 f"  Missing: {', '.join(missing)}\n\n"
                 "  Usage:\n"
-                "    hermes vaultwarden setup \\\n"
-                "      --session '<bw-session-token>' \\\n"
-                "      --item-name 'Hermes'"
+                "    bw unlock --raw | hermes vaultwarden setup \\\n"
+                "      --session-stdin --item-name 'Hermes'"
             )
             return 1
 
@@ -194,12 +220,18 @@ def cmd_setup(args: argparse.Namespace) -> int:
     # ------------------------------------------------------------------ session
     console.print()
     console.print("[bold]Step 3[/bold]  Provide the BW_SESSION token")
-    cfg = load_config()
-    secrets_cfg = (cfg.setdefault("secrets", {})
-                     .setdefault("vaultwarden", {}))
-    session_env = secrets_cfg.get("session_env", "BW_SESSION")
 
-    session = (args.session or "").strip() or os.environ.get(session_env, "").strip()
+    session = ""
+    if args.session_stdin:
+        try:
+            session = sys.stdin.readline().strip()
+        except (OSError, ValueError):
+            session = ""
+        if not session:
+            console.print("  [red]--session-stdin was set but stdin was empty.[/red]")
+            return 1
+    else:
+        session = os.environ.get(session_env, "").strip()
     if not session:
         console.print(
             "  Obtain it with: [cyan]export BW_SESSION=$(bw unlock --raw)[/cyan]"
@@ -276,7 +308,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
                 )
                 return None
             return candidate
-        if not sys.stdin.isatty():
+        if args.session_stdin or not sys.stdin.isatty():
             return None
         while True:
             raw = console.input(f"  {label} env var (blank = skip): ").strip()
@@ -295,10 +327,12 @@ def cmd_setup(args: argparse.Namespace) -> int:
         args.password_env, "login.password ->", "password-env"
     )
     notes_env = _prompt_binding(args.notes_env, "notes ->", "notes-env")
+    explicit_allowed_env_vars = _parse_allowed_env_args(args.allowed_env_vars)
 
     # ------------------------------------------------------------------ test
     console.print()
     console.print("[bold]Step 5[/bold]  Test fetch")
+    discovered_env_vars: List[str] = []
     try:
         secrets, warnings = vw.fetch_vaultwarden_secrets(
             session=session,
@@ -308,6 +342,8 @@ def cmd_setup(args: argparse.Namespace) -> int:
             username_env=username_env,
             password_env=password_env,
             notes_env=notes_env,
+            allowed_env_vars=explicit_allowed_env_vars,
+            discovered_env_vars=discovered_env_vars,
         )
     except Exception as exc:  # noqa: BLE001
         console.print(f"  [red]✗ Fetch failed: {exc}[/red]")
@@ -339,8 +375,34 @@ def cmd_setup(args: argparse.Namespace) -> int:
     secrets_cfg["enabled"] = True
     secrets_cfg["item_name"] = item_name
     secrets_cfg.setdefault("session_env", session_env)
-    secrets_cfg.setdefault("cache_ttl_seconds", 300)
-    secrets_cfg.setdefault("override_existing", True)
+    secrets_cfg.setdefault("cache_ttl_seconds", 0)
+    if args.override_existing is not None:
+        secrets_cfg["override_existing"] = bool(args.override_existing)
+    else:
+        secrets_cfg.setdefault("override_existing", False)
+
+    login_targets = {v for v in (username_env, password_env, notes_env) if v}
+    if explicit_allowed_env_vars is not None:
+        allowed_set, allowed_warnings = vw.normalize_allowed_env_vars(
+            explicit_allowed_env_vars
+        )
+        for w in allowed_warnings:
+            console.print(f"  [yellow]warning:[/yellow] {w}")
+        allowed_env_vars = sorted(allowed_set or [])
+    elif secrets_cfg.get("allowed_env_vars") is not None:
+        allowed_cfg_set, allowed_cfg_warnings = vw.normalize_allowed_env_vars(
+            secrets_cfg.get("allowed_env_vars")
+        )
+        for w in allowed_cfg_warnings:
+            console.print(f"  [yellow]warning:[/yellow] {w}")
+        allowed_env_vars = sorted(allowed_cfg_set or [])
+    else:
+        allowed_env_vars = [
+            key
+            for key in sorted(set(discovered_env_vars))
+            if key != session_env and key not in login_targets
+        ]
+    secrets_cfg["allowed_env_vars"] = allowed_env_vars
 
     for key, value in (
         ("username_env", username_env),
@@ -397,6 +459,9 @@ def cmd_status(args: argparse.Namespace) -> int:
 
     binary = vw.find_bw(vw_cfg.get("binary_path"))
     login_bindings, binding_warnings = vw.resolve_login_bindings(vw_cfg)
+    allowed_set, allowlist_warnings = vw.normalize_allowed_env_vars(
+        vw_cfg.get("allowed_env_vars")
+    )
 
     table = Table(show_header=False, box=None, padding=(0, 2))
     table.add_column("", style="bold")
@@ -409,8 +474,17 @@ def cmd_status(args: argparse.Namespace) -> int:
     table.add_row("username_env",     login_bindings["username_env"] or "[dim](unset)[/dim]")
     table.add_row("password_env",     login_bindings["password_env"] or "[dim](unset)[/dim]")
     table.add_row("notes_env",        login_bindings["notes_env"] or "[dim](unset)[/dim]")
+    allowed_cfg = vw_cfg.get("allowed_env_vars")
+    if allowed_cfg is None:
+        allowed_display = "[dim](legacy all non-blocked)[/dim]"
+    else:
+        allowed_display = (
+            ", ".join(sorted(allowed_set or []))
+            or "[dim](deny all custom fields)[/dim]"
+        )
+    table.add_row("allowed_env_vars", allowed_display)
     table.add_row("Override existing", _yn(bool(vw_cfg.get("override_existing", False))))
-    table.add_row("Cache TTL (s)",    str(vw_cfg.get("cache_ttl_seconds", 300)))
+    table.add_row("Cache TTL (s)",    str(vw_cfg.get("cache_ttl_seconds", 0)))
 
     if binary:
         server = _bw_current_server(binary)
@@ -420,7 +494,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         table.add_row("bw binary",   "[red]not found[/red]")
 
     console.print(Panel(table, title="Vaultwarden / Bitwarden PM", border_style="cyan"))
-    for w in binding_warnings:
+    for w in [*binding_warnings, *allowlist_warnings]:
         console.print(f"  [yellow]warning:[/yellow] {w}")
 
     if not plugin_enabled:
@@ -465,6 +539,9 @@ def cmd_sync(args: argparse.Namespace) -> int:
         return 1
 
     login_bindings, binding_warnings = vw.resolve_login_bindings(vw_cfg)
+    allowed_env_vars, allowlist_warnings = vw.normalize_allowed_env_vars(
+        vw_cfg.get("allowed_env_vars")
+    )
 
     binary = vw.find_bw(vw_cfg.get("binary_path"))
     if binary is None:
@@ -494,12 +571,13 @@ def cmd_sync(args: argparse.Namespace) -> int:
             username_env=login_bindings["username_env"],
             password_env=login_bindings["password_env"],
             notes_env=login_bindings["notes_env"],
+            allowed_env_vars=allowed_env_vars,
         )
     except Exception as exc:  # noqa: BLE001
         console.print(f"[red]Fetch failed: {exc}[/red]")
         return 1
 
-    warnings = list(warnings) + binding_warnings
+    warnings = list(warnings) + binding_warnings + allowlist_warnings
     for w in warnings:
         console.print(f"[yellow]warning:[/yellow] {w}")
 
@@ -563,6 +641,19 @@ def cmd_disable(args: argparse.Namespace) -> int:
 
 def _yn(b: bool) -> str:
     return "[green]yes[/green]" if b else "[dim]no[/dim]"
+
+
+def _parse_allowed_env_args(values: Optional[List[str]]) -> Optional[List[str]]:
+    """Return None to derive from discovery; return [] to allow no custom fields."""
+    if values is None:
+        return None
+    allowed = []
+    for raw in values:
+        for part in str(raw).split(","):
+            name = part.strip()
+            if name:
+                allowed.append(name)
+    return allowed
 
 
 def _bw_version(binary: Path) -> str:

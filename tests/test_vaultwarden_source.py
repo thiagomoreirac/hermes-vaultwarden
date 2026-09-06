@@ -222,8 +222,6 @@ class TestCliHardening:
 
     def test_setup_session_stdin_reads_only_first_line(self, monkeypatch):
         class SingleLineStdin:
-            closed = False
-
             def isatty(self):
                 return False
 

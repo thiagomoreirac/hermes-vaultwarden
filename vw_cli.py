@@ -166,6 +166,13 @@ def cmd_setup(args: argparse.Namespace) -> int:
                      .setdefault("vaultwarden", {}))
     session_env = secrets_cfg.get("session_env", "BW_SESSION")
 
+    if args.session_stdin and not (args.item_name and args.item_name.strip()):
+        console.print(
+            "  [red]--session-stdin requires --item-name because stdin is "
+            "consumed by the session token.[/red]"
+        )
+        return 1
+
     # -- non-interactive guard --
     if not sys.stdin.isatty():
         missing = []
@@ -298,7 +305,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
                 )
                 return None
             return candidate
-        if not sys.stdin.isatty():
+        if args.session_stdin or not sys.stdin.isatty():
             return None
         while True:
             raw = console.input(f"  {label} env var (blank = skip): ").strip()
@@ -444,6 +451,9 @@ def cmd_status(args: argparse.Namespace) -> int:
 
     binary = vw.find_bw(vw_cfg.get("binary_path"))
     login_bindings, binding_warnings = vw.resolve_login_bindings(vw_cfg)
+    _, allowlist_warnings = vw.normalize_allowed_env_vars(
+        vw_cfg.get("allowed_env_vars")
+    )
 
     table = Table(show_header=False, box=None, padding=(0, 2))
     table.add_column("", style="bold")
@@ -477,7 +487,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         table.add_row("bw binary",   "[red]not found[/red]")
 
     console.print(Panel(table, title="Vaultwarden / Bitwarden PM", border_style="cyan"))
-    for w in binding_warnings:
+    for w in [*binding_warnings, *allowlist_warnings]:
         console.print(f"  [yellow]warning:[/yellow] {w}")
 
     if not plugin_enabled:
@@ -522,6 +532,9 @@ def cmd_sync(args: argparse.Namespace) -> int:
         return 1
 
     login_bindings, binding_warnings = vw.resolve_login_bindings(vw_cfg)
+    allowed_env_vars, allowlist_warnings = vw.normalize_allowed_env_vars(
+        vw_cfg.get("allowed_env_vars")
+    )
 
     binary = vw.find_bw(vw_cfg.get("binary_path"))
     if binary is None:
@@ -551,13 +564,13 @@ def cmd_sync(args: argparse.Namespace) -> int:
             username_env=login_bindings["username_env"],
             password_env=login_bindings["password_env"],
             notes_env=login_bindings["notes_env"],
-            allowed_env_vars=vw_cfg.get("allowed_env_vars"),
+            allowed_env_vars=allowed_env_vars,
         )
     except Exception as exc:  # noqa: BLE001
         console.print(f"[red]Fetch failed: {exc}[/red]")
         return 1
 
-    warnings = list(warnings) + binding_warnings
+    warnings = list(warnings) + binding_warnings + allowlist_warnings
     for w in warnings:
         console.print(f"[yellow]warning:[/yellow] {w}")
 

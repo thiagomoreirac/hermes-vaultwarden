@@ -246,7 +246,7 @@ class TestCliHardening:
         monkeypatch.setattr(vw_cli.vw, "fetch_vaultwarden_secrets", fetch)
 
         assert vw_cli.cmd_sync(argparse.Namespace(apply=False)) == 0
-        assert fetch.call_args.kwargs["allowed_env_vars"] == ["SAFE_API_KEY"]
+        assert fetch.call_args.kwargs["allowed_env_vars"] == {"SAFE_API_KEY"}
 
 
 # ---------------------------------------------------------------------------

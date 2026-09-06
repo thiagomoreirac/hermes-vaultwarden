@@ -75,7 +75,7 @@ clears it from `config.yaml`.
 | `username_env` | — | Env var for `login.username`; unset = not exported |
 | `password_env` | — | Env var for `login.password`; unset = not exported |
 | `notes_env` | — | Env var for the item's `notes`; unset = not exported |
-| `allowed_env_vars` | unset | Custom-field env vars allowed to export; setup writes the fields it discovered |
+| `allowed_env_vars` | unset | Custom-field env vars allowed to export; unset = legacy all non-blocked, `[]` = deny all |
 | `override_existing` | `false` | Overwrite vars already set by `.env`/shell (never another secret source) |
 | `cache_ttl_seconds` | `0` | TTL for both cache layers; `0` disables caching entirely |
 | `binary_path` | — | Pin an exact `bw` binary path |

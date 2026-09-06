@@ -43,7 +43,7 @@ import logging
 import os
 import shutil
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from agent.secret_sources.base import (
     ErrorKind,
@@ -280,7 +280,8 @@ def fetch_vaultwarden_secrets(
         notes_env or "",
         _allowed_env_key(allowed_set),
     )
-    if use_cache and cache_ttl_seconds > 0:
+    caching_enabled = use_cache and cache_ttl_seconds > 0
+    if caching_enabled:
         cached = _CACHE.get(cache_key)
         if cached and cached.is_fresh(cache_ttl_seconds):
             return cached.secrets, allowed_warnings
@@ -309,10 +310,37 @@ def fetch_vaultwarden_secrets(
     import time as _time
 
     entry = CachedFetch(secrets=secrets, fetched_at=_time.time())
-    if use_cache and cache_ttl_seconds > 0:
+    if caching_enabled:
         _CACHE[cache_key] = entry
         _DISK_CACHE.write(cache_key, entry, cache_ttl_seconds, home_path)
     return secrets, all_warnings
+
+
+def _load_bw_item(bw: Path, session: str, item_name: str) -> Any:
+    # Session travels via the child env (bw reads BW_SESSION natively)
+    # instead of a --session argv flag, keeping the token out of
+    # /proc/<pid>/cmdline.  The item name follows a `--` terminator so a
+    # user-named item like "--raw" can never parse as a flag.
+    proc = run_secret_cli(
+        [str(bw), "get", "item", "--", item_name],
+        allow_env=_BW_ALLOW_ENV,
+        extra_env={"BW_SESSION": session},
+        timeout=_BW_RUN_TIMEOUT,
+    )
+
+    if proc.returncode != 0:
+        err = scrub_ansi((proc.stderr or proc.stdout or "")).strip()
+        raise RuntimeError(f"bw exited {proc.returncode}: {err[:200]}")
+
+    raw = (proc.stdout or "").strip()
+    if not raw:
+        return {}
+
+    try:
+        item = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"bw returned non-JSON output: {exc}") from exc
+    return item
 
 
 def discover_vaultwarden_custom_field_names(
@@ -329,19 +357,7 @@ def discover_vaultwarden_custom_field_names(
             "https://github.com/bitwarden/clients/releases"
         )
 
-    proc = run_secret_cli(
-        [str(bw), "get", "item", "--", item_name],
-        allow_env=_BW_ALLOW_ENV,
-        extra_env={"BW_SESSION": session},
-        timeout=_BW_RUN_TIMEOUT,
-    )
-    if proc.returncode != 0:
-        err = scrub_ansi((proc.stderr or proc.stdout or "")).strip()
-        raise RuntimeError(f"bw exited {proc.returncode}: {err[:200]}")
-    try:
-        item = json.loads((proc.stdout or "").strip() or "{}")
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"bw returned non-JSON output: {exc}") from exc
+    item = _load_bw_item(bw, session, item_name)
     if not isinstance(item, dict):
         return [], [f"bw returned unexpected shape: {type(item).__name__}"]
 
@@ -375,29 +391,9 @@ def _run_bw_get_item(
     notes_env: Optional[str] = None,
     allowed_env_vars: Optional[Set[str]] = None,
 ) -> Tuple[Dict[str, str], List[str]]:
-    # Session travels via the child env (bw reads BW_SESSION natively)
-    # instead of a --session argv flag, keeping the token out of
-    # /proc/<pid>/cmdline.  The item name follows a `--` terminator so a
-    # user-named item like "--raw" can never parse as a flag.
-    proc = run_secret_cli(
-        [str(bw), "get", "item", "--", item_name],
-        allow_env=_BW_ALLOW_ENV,
-        extra_env={"BW_SESSION": session},
-        timeout=_BW_RUN_TIMEOUT,
-    )
-
-    if proc.returncode != 0:
-        err = scrub_ansi((proc.stderr or proc.stdout or "")).strip()
-        raise RuntimeError(f"bw exited {proc.returncode}: {err[:200]}")
-
-    raw = (proc.stdout or "").strip()
-    if not raw:
+    item = _load_bw_item(bw, session, item_name)
+    if not item:
         return {}, ["bw returned no output"]
-
-    try:
-        item = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"bw returned non-JSON output: {exc}") from exc
 
     if not isinstance(item, dict):
         raise RuntimeError(f"bw returned unexpected shape: {type(item).__name__}")
@@ -589,8 +585,8 @@ class VaultwardenSource(SecretSource):
             "allowed_env_vars": {
                 "description": (
                     "Custom-field env vars allowed to export.  If unset, legacy "
-                    "configs allow all non-blocked fields; setup writes an "
-                    "explicit list."
+                    "configs allow all non-blocked fields; an empty list denies "
+                    "all custom fields; setup writes an explicit list."
                 ),
                 "default": None,
             },

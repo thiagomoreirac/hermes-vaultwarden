@@ -20,14 +20,15 @@ Design summary
 
       bw get item -- "<item_name>"     (BW_SESSION passed via child env)
 
-  Every custom field whose name is a valid env-var identifier is offered
-  to the orchestrator.  The item's structural ``login.username``,
-  ``login.password`` and ``notes`` are *not* custom fields and are only
-  exported when the user opts in via ``username_env`` / ``password_env``
-  / ``notes_env`` — there's no default name to guess, so silence beats a
-  wrong guess.  :meth:`VaultwardenSource.fetch` never writes
+  Setup records the discovered custom-field names in ``allowed_env_vars``.
+  Later custom fields are skipped until explicitly allowed, and high-risk
+  process/network control variables are always blocked.  The item's
+  structural ``login.username``, ``login.password`` and ``notes`` are only
+  exported when the user opts in via ``username_env`` / ``password_env`` /
+  ``notes_env``.  :meth:`VaultwardenSource.fetch` never writes
   ``os.environ`` itself.
-* Caching: two-layer (in-process dict + disk JSON via the shared
+* Caching: off by default.  When ``cache_ttl_seconds`` is positive, a
+  two-layer cache is used (in-process dict + disk JSON via the shared
   :class:`agent.secret_sources._cache.DiskCache` substrate), written to
   ``<hermes_home>/cache/vaultwarden_cache.json``.
 * Failures NEVER block Hermes startup — ``fetch()`` returns a
@@ -42,7 +43,7 @@ import logging
 import os
 import shutil
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 from agent.secret_sources.base import (
     ErrorKind,
@@ -58,7 +59,7 @@ logger = logging.getLogger(__name__)
 
 _BW_RUN_TIMEOUT = 30.0
 _DEFAULT_SESSION_ENV = "BW_SESSION"
-_DEFAULT_CACHE_TTL = 300.0
+_DEFAULT_CACHE_TTL = 0.0
 
 # Extra env vars the bw child process may need beyond run_secret_cli's
 # base allowlist (HOME/PATH/locale).  BITWARDENCLI_APPDATA_DIR relocates
@@ -66,14 +67,74 @@ _DEFAULT_CACHE_TTL = 300.0
 # silently talk to an empty vault.
 _BW_ALLOW_ENV = ("BITWARDENCLI_APPDATA_DIR",)
 
-_CacheKey = Tuple[str, str, str, str, str, str]
+_BLOCKED_ENV_EXACT = {
+    "ALL_PROXY",
+    "ANTHROPIC_BASE_URL",
+    "AWS_CONFIG_FILE",
+    "AWS_ENDPOINT_URL",
+    "AWS_PROFILE",
+    "AWS_SHARED_CREDENTIALS_FILE",
+    "BASH_ENV",
+    "BITWARDENCLI_APPDATA_DIR",
+    "CDPATH",
+    "CLOUDSDK_CONFIG",
+    "DYLD_FALLBACK_LIBRARY_PATH",
+    "DYLD_INSERT_LIBRARIES",
+    "DYLD_LIBRARY_PATH",
+    "ENV",
+    "GIT_ASKPASS",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_SSH",
+    "GIT_SSH_COMMAND",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "HTTPS_PROXY",
+    "HTTP_PROXY",
+    "IFS",
+    "KUBECONFIG",
+    "LD_AUDIT",
+    "LD_LIBRARY_PATH",
+    "LD_PRELOAD",
+    "NODE_OPTIONS",
+    "NO_PROXY",
+    "OLLAMA_HOST",
+    "OPENAI_API_BASE",
+    "OPENAI_BASE_URL",
+    "OPENROUTER_BASE_URL",
+    "PATH",
+    "PROMPT_COMMAND",
+    "PYTHONHOME",
+    "PYTHONPATH",
+    "PYTHONSTARTUP",
+    "REQUESTS_CA_BUNDLE",
+    "RUBYOPT",
+    "SHELLOPTS",
+    "SSL_CERT_FILE",
+}
+_BLOCKED_ENV_SUFFIXES = (
+    "_BASE_URL",
+    "_PROXY",
+    "_CA_BUNDLE",
+)
+
+_CacheKey = Tuple[str, str, str, str, str, str, str]
 # (resolved_home, session_fingerprint, item_name,
-#  username_env, password_env, notes_env)
+#  username_env, password_env, notes_env, allowed_env_key)
 
 
 def _cache_key_str(cache_key: _CacheKey) -> str:
-    _home, session_fp, item_name, username_env, password_env, notes_env = cache_key
-    return f"vw|{session_fp}|{item_name}|{username_env}|{password_env}|{notes_env}"
+    (
+        _home,
+        session_fp,
+        item_name,
+        username_env,
+        password_env,
+        notes_env,
+        allowed_env_key,
+    ) = cache_key
+    return (
+        f"vw|{session_fp}|{item_name}|{username_env}|{password_env}|"
+        f"{notes_env}|{allowed_env_key}"
+    )
 
 
 _CACHE: Dict[_CacheKey, CachedFetch] = {}
@@ -133,6 +194,49 @@ def _session_fingerprint(session: str) -> str:
     return hashlib.sha256(session.encode("utf-8")).hexdigest()[:16]
 
 
+def _is_blocked_env_name(name: str) -> bool:
+    upper = name.upper()
+    return upper in _BLOCKED_ENV_EXACT or any(
+        upper.endswith(suffix) for suffix in _BLOCKED_ENV_SUFFIXES
+    )
+
+
+def _normalize_allowed_env_vars(raw: object) -> Tuple[Optional[Set[str]], List[str]]:
+    """Return an allowlist set, or None when legacy allow-all mode is active."""
+    if raw is None:
+        return None, []
+    if isinstance(raw, str):
+        values: Iterable[object] = [
+            part.strip() for part in raw.replace("\n", ",").split(",")
+        ]
+    elif isinstance(raw, (list, tuple, set, frozenset)):
+        values = raw
+    else:
+        return set(), [
+            "secrets.vaultwarden.allowed_env_vars must be a list or comma-separated string"
+        ]
+
+    allowed: Set[str] = set()
+    warnings: List[str] = []
+    for value in values:
+        name = str(value or "").strip()
+        if not name:
+            continue
+        if not is_valid_env_name(name):
+            warnings.append(
+                f"Skipping allowed_env_vars entry {name!r}: not a valid env-var name"
+            )
+            continue
+        allowed.add(name)
+    return allowed, warnings
+
+
+def _allowed_env_key(allowed_env_vars: Optional[Set[str]]) -> str:
+    if allowed_env_vars is None:
+        return "*"
+    return ",".join(sorted(allowed_env_vars))
+
+
 def fetch_vaultwarden_secrets(
     *,
     session: str,
@@ -144,10 +248,11 @@ def fetch_vaultwarden_secrets(
     username_env: Optional[str] = None,
     password_env: Optional[str] = None,
     notes_env: Optional[str] = None,
+    allowed_env_vars: Optional[Iterable[str]] = None,
 ) -> Tuple[Dict[str, str], List[str]]:
     """Pull secrets from a vault item via ``bw get item``.
 
-    Every custom field becomes an env var.  ``login.username``,
+    Allowed custom fields become env vars.  ``login.username``,
     ``login.password`` and ``notes`` are structural (not custom fields)
     and are only included when the caller opts in via ``username_env`` /
     ``password_env`` / ``notes_env`` — the target env-var name for each.
@@ -162,6 +267,8 @@ def fetch_vaultwarden_secrets(
     if not item_name:
         raise RuntimeError("Vaultwarden item_name is empty")
 
+    allowed_set, allowed_warnings = _normalize_allowed_env_vars(allowed_env_vars)
+
     cache_key: _CacheKey = (
         str(resolve_cache_home(home_path)),
         _session_fingerprint(session),
@@ -169,15 +276,16 @@ def fetch_vaultwarden_secrets(
         username_env or "",
         password_env or "",
         notes_env or "",
+        _allowed_env_key(allowed_set),
     )
     if use_cache:
         cached = _CACHE.get(cache_key)
         if cached and cached.is_fresh(cache_ttl_seconds):
-            return cached.secrets, []
+            return cached.secrets, allowed_warnings
         disk_cached = _DISK_CACHE.read(cache_key, cache_ttl_seconds, home_path)
         if disk_cached is not None:
             _CACHE[cache_key] = disk_cached
-            return disk_cached.secrets, []
+            return disk_cached.secrets, allowed_warnings
 
     bw = binary or find_bw()
     if bw is None:
@@ -193,12 +301,14 @@ def fetch_vaultwarden_secrets(
         username_env=username_env,
         password_env=password_env,
         notes_env=notes_env,
+        allowed_env_vars=allowed_set,
     )
+    warnings = allowed_warnings + warnings
     import time as _time
 
     entry = CachedFetch(secrets=secrets, fetched_at=_time.time())
-    _CACHE[cache_key] = entry
-    if use_cache:
+    if use_cache and cache_ttl_seconds > 0:
+        _CACHE[cache_key] = entry
         _DISK_CACHE.write(cache_key, entry, cache_ttl_seconds, home_path)
     return secrets, warnings
 
@@ -211,6 +321,7 @@ def _run_bw_get_item(
     username_env: Optional[str] = None,
     password_env: Optional[str] = None,
     notes_env: Optional[str] = None,
+    allowed_env_vars: Optional[Set[str]] = None,
 ) -> Tuple[Dict[str, str], List[str]]:
     # Session travels via the child env (bw reads BW_SESSION natively)
     # instead of a --session argv flag, keeping the token out of
@@ -256,6 +367,16 @@ def _run_bw_get_item(
         if not is_valid_env_name(name):
             warnings.append(f"Skipping field {name!r}: not a valid env-var name")
             continue
+        if _is_blocked_env_name(name):
+            warnings.append(
+                f"Skipping field {name!r}: env var is blocked for agent safety"
+            )
+            continue
+        if allowed_env_vars is not None and name not in allowed_env_vars:
+            warnings.append(
+                f"Skipping field {name!r}: not listed in allowed_env_vars"
+            )
+            continue
         secrets[name] = value
 
     if not fields and not (username_env or password_env or notes_env):
@@ -276,6 +397,12 @@ def _run_bw_get_item(
             continue
         if value is None or value == "":
             warnings.append(f"item has no {label} to export as {env_name}")
+            continue
+        if _is_blocked_env_name(env_name):
+            warnings.append(
+                f"Skipping {label} binding {env_name!r}: env var is blocked "
+                "for agent safety"
+            )
             continue
         if env_name in secrets:
             warnings.append(
@@ -407,6 +534,14 @@ class VaultwardenSource(SecretSource):
                 ),
                 "default": False,
             },
+            "allowed_env_vars": {
+                "description": (
+                    "Custom-field env vars allowed to export.  If unset, legacy "
+                    "configs allow all non-blocked fields; setup writes an "
+                    "explicit list."
+                ),
+                "default": [],
+            },
             "cache_ttl_seconds": {
                 "description": "Cache TTL for both cache layers; 0 disables caching",
                 "default": int(_DEFAULT_CACHE_TTL),
@@ -458,7 +593,10 @@ class VaultwardenSource(SecretSource):
             ttl = _DEFAULT_CACHE_TTL
 
         login_bindings, binding_warnings = resolve_login_bindings(cfg)
-        result.warnings.extend(binding_warnings)
+        allowed_env_vars, allowed_warnings = _normalize_allowed_env_vars(
+            cfg.get("allowed_env_vars")
+        )
+        result.warnings.extend(binding_warnings + allowed_warnings)
 
         try:
             secrets, warnings = fetch_vaultwarden_secrets(
@@ -470,6 +608,7 @@ class VaultwardenSource(SecretSource):
                 username_env=login_bindings["username_env"],
                 password_env=login_bindings["password_env"],
                 notes_env=login_bindings["notes_env"],
+                allowed_env_vars=allowed_env_vars,
             )
         except RuntimeError as exc:
             result.error = str(exc)

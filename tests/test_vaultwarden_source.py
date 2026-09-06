@@ -6,6 +6,7 @@ fast and offline-safe.
 
 from __future__ import annotations
 
+import argparse
 import json
 import subprocess
 import time
@@ -18,6 +19,7 @@ from agent.secret_sources.base import ErrorKind
 from agent.secret_sources import registry
 
 import vw_source as vw
+import vw_cli
 
 
 # ---------------------------------------------------------------------------
@@ -160,6 +162,35 @@ class TestResolveLoginBindings:
 
 
 # ---------------------------------------------------------------------------
+# CLI hardening
+# ---------------------------------------------------------------------------
+
+
+class TestCliHardening:
+    def test_setup_does_not_accept_session_on_argv(self):
+        parser = argparse.ArgumentParser()
+        vw_cli.setup_parser(parser)
+        setup_parser = next(
+            action.choices["setup"]
+            for action in parser._actions
+            if isinstance(action, argparse._SubParsersAction)
+        )
+        option_strings = {
+            option
+            for action in setup_parser._actions
+            for option in action.option_strings
+        }
+        assert "--session" not in option_strings
+        assert "--session-stdin" in option_strings
+
+    def test_override_existing_setup_default_is_false(self):
+        parser = argparse.ArgumentParser()
+        vw_cli.setup_parser(parser)
+        args = parser.parse_args(["setup", "--item-name", "Hermes"])
+        assert args.override_existing is False
+
+
+# ---------------------------------------------------------------------------
 # fetch_vaultwarden_secrets
 # ---------------------------------------------------------------------------
 
@@ -181,6 +212,45 @@ class TestFetchVaultwardenSecrets:
         assert secrets["ANTHROPIC_API_KEY"] == "sk-ant-test"
         assert "123INVALID" not in secrets
         assert any("123INVALID" in w for w in warnings)
+
+    def test_allowed_env_vars_filters_custom_fields(self, tmp_path):
+        with mock.patch("subprocess.run", return_value=_make_ok_proc()):
+            secrets, warnings = vw.fetch_vaultwarden_secrets(
+                session=_FAKE_SESSION,
+                item_name="Hermes",
+                binary=Path("/usr/bin/bw"),
+                use_cache=False,
+                home_path=tmp_path,
+                allowed_env_vars=["OPENROUTER_API_KEY"],
+            )
+        assert secrets == {"OPENROUTER_API_KEY": "sk-or-test"}
+        assert any("ANTHROPIC_API_KEY" in w and "allowed_env_vars" in w for w in warnings)
+
+    def test_blocklisted_env_vars_are_never_exported(self, tmp_path):
+        item = {
+            **_FAKE_ITEM,
+            "fields": [
+                {
+                    "name": "OPENAI_BASE_URL",
+                    "value": "https://evil.invalid",
+                    "type": 1,
+                },
+                {"name": "HTTPS_PROXY", "value": "http://evil.invalid", "type": 1},
+                {"name": "SAFE_API_KEY", "value": "safe", "type": 1},
+            ],
+        }
+        with mock.patch("subprocess.run", return_value=_make_ok_proc(item)):
+            secrets, warnings = vw.fetch_vaultwarden_secrets(
+                session=_FAKE_SESSION,
+                item_name="Hermes",
+                binary=Path("/usr/bin/bw"),
+                use_cache=False,
+                home_path=tmp_path,
+                allowed_env_vars=["OPENAI_BASE_URL", "HTTPS_PROXY", "SAFE_API_KEY"],
+            )
+        assert secrets == {"SAFE_API_KEY": "safe"}
+        assert any("OPENAI_BASE_URL" in w and "blocked" in w for w in warnings)
+        assert any("HTTPS_PROXY" in w and "blocked" in w for w in warnings)
 
     def test_child_env_is_minimal_and_session_not_in_argv(self, tmp_path):
         with mock.patch("subprocess.run", return_value=_make_ok_proc()) as mock_run:
@@ -247,6 +317,7 @@ class TestFetchVaultwardenSecrets:
                     item_name="Hermes",
                     binary=Path("/usr/bin/bw"),
                     use_cache=True,
+                    cache_ttl_seconds=300,
                     home_path=tmp_path,
                 )
         assert mock_run.call_count == 1
@@ -258,6 +329,7 @@ class TestFetchVaultwardenSecrets:
                 item_name="Hermes",
                 binary=Path("/usr/bin/bw"),
                 use_cache=True,
+                cache_ttl_seconds=300,
                 home_path=tmp_path,
             )
             vw._CACHE.clear()
@@ -266,6 +338,7 @@ class TestFetchVaultwardenSecrets:
                 item_name="Hermes",
                 binary=Path("/usr/bin/bw"),
                 use_cache=True,
+                cache_ttl_seconds=300,
                 home_path=tmp_path,
             )
         assert mock_run.call_count == 1
@@ -396,6 +469,7 @@ class TestFetchVaultwardenSecrets:
                 item_name="Hermes",
                 binary=Path("/usr/bin/bw"),
                 use_cache=True,
+                cache_ttl_seconds=300,
                 home_path=tmp_path,
             )
             secrets, _ = vw.fetch_vaultwarden_secrets(
@@ -403,6 +477,7 @@ class TestFetchVaultwardenSecrets:
                 item_name="Hermes",
                 binary=Path("/usr/bin/bw"),
                 use_cache=True,
+                cache_ttl_seconds=300,
                 home_path=tmp_path,
                 username_env="SVC_USER",
             )
@@ -654,6 +729,7 @@ class TestDiskCache:
                 item_name="Hermes",
                 binary=Path("/usr/bin/bw"),
                 use_cache=True,
+                cache_ttl_seconds=300,
                 home_path=tmp_path,
             )
         cache_path = vw._disk_cache_path(tmp_path)
@@ -668,6 +744,7 @@ class TestDiskCache:
                 item_name="Hermes",
                 binary=Path("/usr/bin/bw"),
                 use_cache=True,
+                cache_ttl_seconds=300,
                 home_path=tmp_path,
             )
         payload = json.loads(vw._disk_cache_path(tmp_path).read_text())
@@ -693,6 +770,7 @@ class TestDiskCache:
                 item_name="Hermes",
                 binary=Path("/usr/bin/bw"),
                 use_cache=True,
+                cache_ttl_seconds=300,
                 home_path=tmp_path,
             )
         assert vw._CACHE

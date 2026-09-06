@@ -110,6 +110,8 @@ _BLOCKED_ENV_EXACT = {
     "SHELLOPTS",
     "SSL_CERT_FILE",
 }
+# These broad suffixes block common exfiltration pivots: LLM endpoint
+# redirection, traffic interception through proxies, and TLS trust overrides.
 _BLOCKED_ENV_SUFFIXES = (
     "_BASE_URL",
     "_PROXY",
@@ -278,7 +280,7 @@ def fetch_vaultwarden_secrets(
         notes_env or "",
         _allowed_env_key(allowed_set),
     )
-    if use_cache:
+    if use_cache and cache_ttl_seconds > 0:
         cached = _CACHE.get(cache_key)
         if cached and cached.is_fresh(cache_ttl_seconds):
             return cached.secrets, allowed_warnings
@@ -303,14 +305,64 @@ def fetch_vaultwarden_secrets(
         notes_env=notes_env,
         allowed_env_vars=allowed_set,
     )
-    warnings = allowed_warnings + warnings
+    all_warnings = [*allowed_warnings, *warnings]
     import time as _time
 
     entry = CachedFetch(secrets=secrets, fetched_at=_time.time())
     if use_cache and cache_ttl_seconds > 0:
         _CACHE[cache_key] = entry
         _DISK_CACHE.write(cache_key, entry, cache_ttl_seconds, home_path)
-    return secrets, warnings
+    return secrets, all_warnings
+
+
+def discover_vaultwarden_custom_field_names(
+    *,
+    session: str,
+    item_name: str,
+    binary: Optional[Path] = None,
+) -> Tuple[List[str], List[str]]:
+    """Return valid, non-blocked custom-field names from a vault item."""
+    bw = binary or find_bw()
+    if bw is None:
+        raise RuntimeError(
+            "bw binary not found.  Install it from your package manager or "
+            "https://github.com/bitwarden/clients/releases"
+        )
+
+    proc = run_secret_cli(
+        [str(bw), "get", "item", "--", item_name],
+        allow_env=_BW_ALLOW_ENV,
+        extra_env={"BW_SESSION": session},
+        timeout=_BW_RUN_TIMEOUT,
+    )
+    if proc.returncode != 0:
+        err = scrub_ansi((proc.stderr or proc.stdout or "")).strip()
+        raise RuntimeError(f"bw exited {proc.returncode}: {err[:200]}")
+    try:
+        item = json.loads((proc.stdout or "").strip() or "{}")
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"bw returned non-JSON output: {exc}") from exc
+    if not isinstance(item, dict):
+        return [], [f"bw returned unexpected shape: {type(item).__name__}"]
+
+    names: List[str] = []
+    warnings: List[str] = []
+    for f in item.get("fields") or []:
+        if not isinstance(f, dict):
+            continue
+        name = f.get("name")
+        if not isinstance(name, str):
+            continue
+        if not is_valid_env_name(name):
+            warnings.append(f"Skipping field {name!r}: not a valid env-var name")
+            continue
+        if _is_blocked_env_name(name):
+            warnings.append(
+                f"Skipping field {name!r}: env var is blocked for agent safety"
+            )
+            continue
+        names.append(name)
+    return sorted(set(names)), warnings
 
 
 def _run_bw_get_item(

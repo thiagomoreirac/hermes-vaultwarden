@@ -217,7 +217,10 @@ def cmd_setup(args: argparse.Namespace) -> int:
     if args.session_stdin:
         stdin_value = sys.stdin.read().strip() if not sys.stdin.closed else ""
         session = stdin_value.splitlines()[0].strip() if stdin_value else ""
-    if not session:
+        if not session:
+            console.print("  [red]--session-stdin was set but stdin was empty.[/red]")
+            return 1
+    else:
         session = os.environ.get(session_env, "").strip()
     if not session:
         console.print(
@@ -372,9 +375,18 @@ def cmd_setup(args: argparse.Namespace) -> int:
             console.print(f"  [yellow]warning:[/yellow] {w}")
         allowed_env_vars = sorted(allowed_set or [])
     else:
-        allowed_env_vars = sorted(
-            key for key in secrets if key != session_env and key not in login_targets
+        allowed_env_vars, allowlist_warnings = vw.discover_vaultwarden_custom_field_names(
+            session=session,
+            item_name=item_name,
+            binary=binary,
         )
+        for w in allowlist_warnings:
+            console.print(f"  [yellow]warning:[/yellow] {w}")
+        allowed_env_vars = [
+            key
+            for key in allowed_env_vars
+            if key != session_env and key not in login_targets
+        ]
     secrets_cfg["allowed_env_vars"] = allowed_env_vars
 
     for key, value in (
@@ -444,7 +456,16 @@ def cmd_status(args: argparse.Namespace) -> int:
     table.add_row("username_env",     login_bindings["username_env"] or "[dim](unset)[/dim]")
     table.add_row("password_env",     login_bindings["password_env"] or "[dim](unset)[/dim]")
     table.add_row("notes_env",        login_bindings["notes_env"] or "[dim](unset)[/dim]")
-    table.add_row("allowed_env_vars", ", ".join(vw_cfg.get("allowed_env_vars") or []) or "[dim](legacy all non-blocked)[/dim]")
+    allowed_cfg = vw_cfg.get("allowed_env_vars")
+    if allowed_cfg is None:
+        allowed_display = "[dim](legacy all non-blocked)[/dim]"
+    else:
+        allowed_set, _ = vw.normalize_allowed_env_vars(allowed_cfg)
+        allowed_display = (
+            ", ".join(sorted(allowed_set or []))
+            or "[dim](deny all custom fields)[/dim]"
+        )
+    table.add_row("allowed_env_vars", allowed_display)
     table.add_row("Override existing", _yn(bool(vw_cfg.get("override_existing", False))))
     table.add_row("Cache TTL (s)",    str(vw_cfg.get("cache_ttl_seconds", 0)))
 
@@ -603,6 +624,7 @@ def _yn(b: bool) -> str:
 
 
 def _parse_allowed_env_args(values: Optional[List[str]]) -> Optional[List[str]]:
+    """Return None to derive from discovery; return [] to allow no custom fields."""
     if values is None:
         return None
     allowed = []

@@ -386,7 +386,10 @@ def cmd_setup(args: argparse.Namespace) -> int:
         for w in allowed_warnings:
             console.print(f"  [yellow]warning:[/yellow] {w}")
         allowed_env_vars = sorted(allowed_set or [])
-    elif "allowed_env_vars" in secrets_cfg:
+    elif (
+        "allowed_env_vars" in secrets_cfg
+        and secrets_cfg.get("allowed_env_vars") is not None
+    ):
         allowed_cfg_set, allowed_cfg_warnings = vw.normalize_allowed_env_vars(
             secrets_cfg.get("allowed_env_vars")
         )

@@ -86,7 +86,7 @@ existing config keeps working unchanged.
 
 ## Behaviour & caveats
 
-- **Bulk source**: all custom fields of the item are offered implicitly.
+- **Bulk source**: custom fields are offered only when allowlisted.
   New setup runs record the discovered fields in `allowed_env_vars`; later
   fields added to the vault item are skipped until you explicitly allow
   them. Existing configs without `allowed_env_vars` keep legacy behaviour

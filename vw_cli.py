@@ -380,7 +380,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
     secrets_cfg.setdefault("session_env", session_env)
     secrets_cfg.setdefault("cache_ttl_seconds", 0)
     if args.override_existing is not None:
-        secrets_cfg["override_existing"] = True
+        secrets_cfg["override_existing"] = bool(args.override_existing)
     else:
         secrets_cfg.setdefault("override_existing", False)
 

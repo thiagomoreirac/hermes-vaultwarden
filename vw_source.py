@@ -330,6 +330,10 @@ def fetch_vaultwarden_secrets(
 
 
 def _load_bw_item(bw: Path, session: str, item_name: str) -> Any:
+    """Load one vault item as JSON; return None for empty output.
+
+    Raises RuntimeError when ``bw`` fails or returns non-JSON output.
+    """
     # Session travels via the child env (bw reads BW_SESSION natively)
     # instead of a --session argv flag, keeping the token out of
     # /proc/<pid>/cmdline.  The item name follows a `--` terminator so a
@@ -394,11 +398,11 @@ def _run_bw_get_item(
                 f"Skipping field {name!r}: env var is blocked for agent safety"
             )
             continue
-        if discovered_env_vars is not None:
-            discovered_env_vars.append(name)
         value = f.get("value")
         if value is None:
             continue
+        if discovered_env_vars is not None:
+            discovered_env_vars.append(name)
         value = str(value)
         if allowed_env_vars is not None and name not in allowed_env_vars:
             warnings.append(

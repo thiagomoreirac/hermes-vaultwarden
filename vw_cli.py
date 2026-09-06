@@ -213,10 +213,12 @@ def cmd_setup(args: argparse.Namespace) -> int:
     console.print()
     console.print("[bold]Step 3[/bold]  Provide the BW_SESSION token")
 
-    session = os.environ.get(session_env, "").strip()
-    if not session and args.session_stdin:
+    session = ""
+    if args.session_stdin:
         stdin_value = sys.stdin.read().strip() if not sys.stdin.closed else ""
         session = stdin_value.splitlines()[0].strip() if stdin_value else ""
+    if not session:
+        session = os.environ.get(session_env, "").strip()
     if not session:
         console.print(
             "  Obtain it with: [cyan]export BW_SESSION=$(bw unlock --raw)[/cyan]"
@@ -363,7 +365,11 @@ def cmd_setup(args: argparse.Namespace) -> int:
 
     login_targets = {v for v in (username_env, password_env, notes_env) if v}
     if explicit_allowed_env_vars is not None:
-        allowed_set, _ = vw._normalize_allowed_env_vars(explicit_allowed_env_vars)
+        allowed_set, allowed_warnings = vw.normalize_allowed_env_vars(
+            explicit_allowed_env_vars
+        )
+        for w in allowed_warnings:
+            console.print(f"  [yellow]warning:[/yellow] {w}")
         allowed_env_vars = sorted(allowed_set or [])
     else:
         allowed_env_vars = sorted(

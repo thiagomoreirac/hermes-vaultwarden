@@ -7,6 +7,7 @@ fast and offline-safe.
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import subprocess
 import time
@@ -170,24 +171,54 @@ class TestCliHardening:
     def test_setup_does_not_accept_session_on_argv(self):
         parser = argparse.ArgumentParser()
         vw_cli.setup_parser(parser)
-        setup_parser = next(
-            action.choices["setup"]
-            for action in parser._actions
-            if isinstance(action, argparse._SubParsersAction)
-        )
-        option_strings = {
-            option
-            for action in setup_parser._actions
-            for option in action.option_strings
-        }
-        assert "--session" not in option_strings
-        assert "--session-stdin" in option_strings
+        with pytest.raises(SystemExit):
+            parser.parse_args(["setup", "--session", "leaky-token"])
+        args = parser.parse_args(["setup", "--session-stdin", "--item-name", "Hermes"])
+        assert args.session_stdin is True
 
     def test_override_existing_setup_default_is_false(self):
         parser = argparse.ArgumentParser()
         vw_cli.setup_parser(parser)
         args = parser.parse_args(["setup", "--item-name", "Hermes"])
         assert args.override_existing is False
+
+    def test_setup_prefers_session_stdin_over_environment(self, monkeypatch):
+        class NonTtyStringIO(io.StringIO):
+            def isatty(self):
+                return False
+
+        saved_config = {}
+        monkeypatch.setenv("BW_SESSION", "stale-session")
+        monkeypatch.setattr(vw_cli.sys, "stdin", NonTtyStringIO("fresh-session\n"))
+        monkeypatch.setattr(vw_cli.vw, "find_bw", lambda: Path("/usr/bin/bw"))
+        monkeypatch.setattr(vw_cli, "_bw_version", lambda _binary: "test")
+        monkeypatch.setattr(vw_cli, "_bw_current_server", lambda _binary: "")
+        monkeypatch.setattr(vw_cli, "load_config", lambda: {})
+        monkeypatch.setattr(vw_cli, "save_config", lambda cfg: saved_config.update(cfg))
+        save_env = mock.Mock()
+        monkeypatch.setattr(vw_cli, "save_env_value", save_env)
+        monkeypatch.setattr(
+            vw_cli.vw,
+            "fetch_vaultwarden_secrets",
+            lambda **_kwargs: ({"SAFE_API_KEY": "safe"}, []),
+        )
+
+        args = argparse.Namespace(
+            session_stdin=True,
+            item_name="Hermes",
+            server_url=None,
+            username_env=None,
+            password_env=None,
+            notes_env=None,
+            allowed_env_vars=None,
+            override_existing=False,
+        )
+
+        assert vw_cli.cmd_setup(args) == 0
+        save_env.assert_called_once_with("BW_SESSION", "fresh-session")
+        vw_cfg = saved_config["secrets"]["vaultwarden"]
+        assert vw_cfg["override_existing"] is False
+        assert vw_cfg["allowed_env_vars"] == ["SAFE_API_KEY"]
 
 
 # ---------------------------------------------------------------------------
@@ -483,6 +514,30 @@ class TestFetchVaultwardenSecrets:
             )
         assert mock_run.call_count == 2
         assert secrets["SVC_USER"] == "svc-hermes"
+
+    def test_cache_key_distinguishes_allowed_env_vars(self, tmp_path):
+        with mock.patch("subprocess.run", return_value=_make_ok_proc()) as mock_run:
+            first, _ = vw.fetch_vaultwarden_secrets(
+                session=_FAKE_SESSION,
+                item_name="Hermes",
+                binary=Path("/usr/bin/bw"),
+                use_cache=True,
+                cache_ttl_seconds=300,
+                home_path=tmp_path,
+                allowed_env_vars=["OPENROUTER_API_KEY"],
+            )
+            second, _ = vw.fetch_vaultwarden_secrets(
+                session=_FAKE_SESSION,
+                item_name="Hermes",
+                binary=Path("/usr/bin/bw"),
+                use_cache=True,
+                cache_ttl_seconds=300,
+                home_path=tmp_path,
+                allowed_env_vars=["ANTHROPIC_API_KEY"],
+            )
+        assert mock_run.call_count == 2
+        assert first == {"OPENROUTER_API_KEY": "sk-or-test"}
+        assert second == {"ANTHROPIC_API_KEY": "sk-ant-test"}
 
     def test_timeout_raises_runtime_error(self, tmp_path):
         with mock.patch(

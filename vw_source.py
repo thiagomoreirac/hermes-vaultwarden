@@ -201,7 +201,7 @@ def _is_blocked_env_name(name: str) -> bool:
     )
 
 
-def _normalize_allowed_env_vars(raw: object) -> Tuple[Optional[Set[str]], List[str]]:
+def normalize_allowed_env_vars(raw: object) -> Tuple[Optional[Set[str]], List[str]]:
     """Return an allowlist set, or None when legacy allow-all mode is active."""
     if raw is None:
         return None, []
@@ -267,7 +267,7 @@ def fetch_vaultwarden_secrets(
     if not item_name:
         raise RuntimeError("Vaultwarden item_name is empty")
 
-    allowed_set, allowed_warnings = _normalize_allowed_env_vars(allowed_env_vars)
+    allowed_set, allowed_warnings = normalize_allowed_env_vars(allowed_env_vars)
 
     cache_key: _CacheKey = (
         str(resolve_cache_home(home_path)),
@@ -540,7 +540,7 @@ class VaultwardenSource(SecretSource):
                     "configs allow all non-blocked fields; setup writes an "
                     "explicit list."
                 ),
-                "default": [],
+                "default": None,
             },
             "cache_ttl_seconds": {
                 "description": "Cache TTL for both cache layers; 0 disables caching",
@@ -593,7 +593,7 @@ class VaultwardenSource(SecretSource):
             ttl = _DEFAULT_CACHE_TTL
 
         login_bindings, binding_warnings = resolve_login_bindings(cfg)
-        allowed_env_vars, allowed_warnings = _normalize_allowed_env_vars(
+        allowed_env_vars, allowed_warnings = normalize_allowed_env_vars(
             cfg.get("allowed_env_vars")
         )
         result.warnings.extend(binding_warnings + allowed_warnings)

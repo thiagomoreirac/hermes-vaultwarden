@@ -224,7 +224,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
     session = ""
     if args.session_stdin:
         session = sys.stdin.readline().strip() if not sys.stdin.closed else ""
-        extra_stdin = sys.stdin.read().strip() if not sys.stdin.closed else ""
+        extra_stdin = sys.stdin.read(1).strip() if not sys.stdin.closed else ""
         if extra_stdin:
             console.print(
                 "  [yellow]warning:[/yellow] ignoring extra stdin after the "

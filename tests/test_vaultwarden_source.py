@@ -220,6 +220,41 @@ class TestCliHardening:
         assert vw_cfg["override_existing"] is False
         assert vw_cfg["allowed_env_vars"] == ["SAFE_API_KEY"]
 
+    def test_setup_persists_explicit_allow_env_values(self, monkeypatch):
+        class NonTtyStringIO(io.StringIO):
+            def isatty(self):
+                return False
+
+        saved_config = {}
+        monkeypatch.setenv("BW_SESSION", _FAKE_SESSION)
+        monkeypatch.setattr(vw_cli.sys, "stdin", NonTtyStringIO(""))
+        monkeypatch.setattr(vw_cli.vw, "find_bw", lambda: Path("/usr/bin/bw"))
+        monkeypatch.setattr(vw_cli, "_bw_version", lambda _binary: "test")
+        monkeypatch.setattr(vw_cli, "_bw_current_server", lambda _binary: "")
+        monkeypatch.setattr(vw_cli, "load_config", lambda: {})
+        monkeypatch.setattr(vw_cli, "save_config", lambda cfg: saved_config.update(cfg))
+        monkeypatch.setattr(vw_cli, "save_env_value", mock.Mock())
+        monkeypatch.setattr(
+            vw_cli.vw,
+            "fetch_vaultwarden_secrets",
+            lambda **_kwargs: ({"SAFE_API_KEY": "safe"}, []),
+        )
+
+        args = argparse.Namespace(
+            session_stdin=False,
+            item_name="Hermes",
+            server_url=None,
+            username_env=None,
+            password_env=None,
+            notes_env=None,
+            allowed_env_vars=["SAFE_API_KEY,OTHER_KEY"],
+            override_existing=None,
+        )
+
+        assert vw_cli.cmd_setup(args) == 0
+        vw_cfg = saved_config["secrets"]["vaultwarden"]
+        assert vw_cfg["allowed_env_vars"] == ["OTHER_KEY", "SAFE_API_KEY"]
+
     def test_sync_passes_configured_allowed_env_vars(self, monkeypatch):
         fetch = mock.Mock(return_value=({"SAFE_API_KEY": "safe"}, []))
         monkeypatch.setenv("BW_SESSION", _FAKE_SESSION)

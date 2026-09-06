@@ -217,7 +217,10 @@ def normalize_allowed_env_vars(raw: object) -> Tuple[Optional[Set[str]], List[st
     returning an empty set plus a warning.
     """
     if raw is None:
-        return None, []
+        return None, [
+            "secrets.vaultwarden.allowed_env_vars is unset; legacy mode allows "
+            "all non-blocked custom fields"
+        ]
     if isinstance(raw, str):
         values: Iterable[object] = [
             part.strip() for part in raw.replace("\n", ",").split(",")
@@ -282,6 +285,11 @@ def fetch_vaultwarden_secrets(
         raise RuntimeError("Vaultwarden item_name is empty")
 
     allowed_set, allowed_warnings = normalize_allowed_env_vars(allowed_env_vars)
+    runtime_warnings: List[str] = []
+    if use_cache and cache_ttl_seconds <= 0:
+        runtime_warnings.append(
+            "Vaultwarden cache disabled because cache_ttl_seconds is not positive"
+        )
 
     cache_key: _CacheKey = (
         str(resolve_cache_home(home_path)),
@@ -296,11 +304,11 @@ def fetch_vaultwarden_secrets(
     if caching_enabled:
         cached = _CACHE.get(cache_key)
         if cached and cached.is_fresh(cache_ttl_seconds):
-            return cached.secrets, allowed_warnings
+            return cached.secrets, [*allowed_warnings, *runtime_warnings]
         disk_cached = _DISK_CACHE.read(cache_key, cache_ttl_seconds, home_path)
         if disk_cached is not None:
             _CACHE[cache_key] = disk_cached
-            return disk_cached.secrets, allowed_warnings
+            return disk_cached.secrets, [*allowed_warnings, *runtime_warnings]
 
     bw = binary or find_bw()
     if bw is None:
@@ -319,7 +327,7 @@ def fetch_vaultwarden_secrets(
         allowed_env_vars=allowed_set,
         discovered_env_vars=discovered_env_vars,
     )
-    all_warnings = [*allowed_warnings, *warnings]
+    all_warnings = [*allowed_warnings, *runtime_warnings, *warnings]
     import time as _time
 
     entry = CachedFetch(secrets=secrets, fetched_at=_time.time())
@@ -401,14 +409,14 @@ def _run_bw_get_item(
         value = f.get("value")
         if value is None:
             continue
-        if discovered_env_vars is not None:
-            discovered_env_vars.append(name)
         value = str(value)
         if allowed_env_vars is not None and name not in allowed_env_vars:
             warnings.append(
                 f"Skipping field {name!r}: not listed in allowed_env_vars"
             )
             continue
+        if discovered_env_vars is not None:
+            discovered_env_vars.append(name)
         secrets[name] = value
 
     if not fields and not (username_env or password_env or notes_env):

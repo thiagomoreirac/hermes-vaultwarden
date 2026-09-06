@@ -27,8 +27,10 @@ Design summary
   exported when the user opts in via ``username_env`` / ``password_env`` /
   ``notes_env``.  :meth:`VaultwardenSource.fetch` never writes
   ``os.environ`` itself.
-* Caching: off by default.  When ``cache_ttl_seconds`` is positive, a
-  two-layer cache is used (in-process dict + disk JSON via the shared
+* Caching: off by default.  This is a breaking safety default for configs
+  that omit ``cache_ttl_seconds``: no cache is read or written unless the
+  value is positive.  When positive, a two-layer cache is used (in-process
+  dict + disk JSON via the shared
   :class:`agent.secret_sources._cache.DiskCache` substrate), written to
   ``<hermes_home>/cache/vaultwarden_cache.json``.
 * Failures NEVER block Hermes startup — ``fetch()`` returns a
@@ -204,7 +206,16 @@ def _is_blocked_env_name(name: str) -> bool:
 
 
 def normalize_allowed_env_vars(raw: object) -> Tuple[Optional[Set[str]], List[str]]:
-    """Return an allowlist set, or None when legacy allow-all mode is active."""
+    """Normalize the custom-field export allowlist.
+
+    Returns:
+      * ``None`` for unset legacy mode, which allows all non-blocked fields.
+      * an empty set for an explicit empty list/string, which denies all fields.
+      * a populated set for an explicit allowlist.
+
+    Invalid names are skipped with warnings.  Invalid value types fail closed by
+    returning an empty set plus a warning.
+    """
     if raw is None:
         return None, []
     if isinstance(raw, str):
@@ -251,6 +262,7 @@ def fetch_vaultwarden_secrets(
     password_env: Optional[str] = None,
     notes_env: Optional[str] = None,
     allowed_env_vars: Optional[Iterable[str]] = None,
+    discovered_env_vars: Optional[List[str]] = None,
 ) -> Tuple[Dict[str, str], List[str]]:
     """Pull secrets from a vault item via ``bw get item``.
 
@@ -305,6 +317,7 @@ def fetch_vaultwarden_secrets(
         password_env=password_env,
         notes_env=notes_env,
         allowed_env_vars=allowed_set,
+        discovered_env_vars=discovered_env_vars,
     )
     all_warnings = [*allowed_warnings, *warnings]
     import time as _time
@@ -334,51 +347,13 @@ def _load_bw_item(bw: Path, session: str, item_name: str) -> Any:
 
     raw = (proc.stdout or "").strip()
     if not raw:
-        return {}
+        return None
 
     try:
         item = json.loads(raw)
     except json.JSONDecodeError as exc:
         raise RuntimeError(f"bw returned non-JSON output: {exc}") from exc
     return item
-
-
-def discover_vaultwarden_custom_field_names(
-    *,
-    session: str,
-    item_name: str,
-    binary: Optional[Path] = None,
-) -> Tuple[List[str], List[str]]:
-    """Return valid, non-blocked custom-field names from a vault item."""
-    bw = binary or find_bw()
-    if bw is None:
-        raise RuntimeError(
-            "bw binary not found.  Install it from your package manager or "
-            "https://github.com/bitwarden/clients/releases"
-        )
-
-    item = _load_bw_item(bw, session, item_name)
-    if not isinstance(item, dict):
-        return [], [f"bw returned unexpected shape: {type(item).__name__}"]
-
-    names: List[str] = []
-    warnings: List[str] = []
-    for f in item.get("fields") or []:
-        if not isinstance(f, dict):
-            continue
-        name = f.get("name")
-        if not isinstance(name, str):
-            continue
-        if not is_valid_env_name(name):
-            warnings.append(f"Skipping field {name!r}: not a valid env-var name")
-            continue
-        if _is_blocked_env_name(name):
-            warnings.append(
-                f"Skipping field {name!r}: env var is blocked for agent safety"
-            )
-            continue
-        names.append(name)
-    return sorted(set(names)), warnings
 
 
 def _run_bw_get_item(
@@ -390,9 +365,10 @@ def _run_bw_get_item(
     password_env: Optional[str] = None,
     notes_env: Optional[str] = None,
     allowed_env_vars: Optional[Set[str]] = None,
+    discovered_env_vars: Optional[List[str]] = None,
 ) -> Tuple[Dict[str, str], List[str]]:
     item = _load_bw_item(bw, session, item_name)
-    if not item:
+    if item is None:
         return {}, ["bw returned no output"]
 
     if not isinstance(item, dict):
@@ -408,10 +384,8 @@ def _run_bw_get_item(
         if not isinstance(f, dict):
             continue
         name = f.get("name")
-        value = f.get("value")
-        if not isinstance(name, str) or value is None:
+        if not isinstance(name, str):
             continue
-        value = str(value)
         if not is_valid_env_name(name):
             warnings.append(f"Skipping field {name!r}: not a valid env-var name")
             continue
@@ -420,6 +394,12 @@ def _run_bw_get_item(
                 f"Skipping field {name!r}: env var is blocked for agent safety"
             )
             continue
+        if discovered_env_vars is not None:
+            discovered_env_vars.append(name)
+        value = f.get("value")
+        if value is None:
+            continue
+        value = str(value)
         if allowed_env_vars is not None and name not in allowed_env_vars:
             warnings.append(
                 f"Skipping field {name!r}: not listed in allowed_env_vars"

@@ -180,7 +180,7 @@ class TestCliHardening:
         parser = argparse.ArgumentParser()
         vw_cli.setup_parser(parser)
         args = parser.parse_args(["setup", "--item-name", "Hermes"])
-        assert args.override_existing is False
+        assert args.override_existing is None
 
     def test_setup_prefers_session_stdin_over_environment(self, monkeypatch):
         class NonTtyStringIO(io.StringIO):
@@ -197,16 +197,11 @@ class TestCliHardening:
         monkeypatch.setattr(vw_cli, "save_config", lambda cfg: saved_config.update(cfg))
         save_env = mock.Mock()
         monkeypatch.setattr(vw_cli, "save_env_value", save_env)
-        monkeypatch.setattr(
-            vw_cli.vw,
-            "fetch_vaultwarden_secrets",
-            lambda **_kwargs: ({"SAFE_API_KEY": "safe"}, []),
-        )
-        monkeypatch.setattr(
-            vw_cli.vw,
-            "discover_vaultwarden_custom_field_names",
-            lambda **_kwargs: (["SAFE_API_KEY"], []),
-        )
+        def fake_fetch(**kwargs):
+            kwargs["discovered_env_vars"].append("SAFE_API_KEY")
+            return {"SAFE_API_KEY": "safe"}, []
+
+        monkeypatch.setattr(vw_cli.vw, "fetch_vaultwarden_secrets", fake_fetch)
 
         args = argparse.Namespace(
             session_stdin=True,
@@ -216,7 +211,7 @@ class TestCliHardening:
             password_env=None,
             notes_env=None,
             allowed_env_vars=None,
-            override_existing=False,
+            override_existing=None,
         )
 
         assert vw_cli.cmd_setup(args) == 0
@@ -284,6 +279,19 @@ class TestFetchVaultwardenSecrets:
             )
         assert secrets == {"OPENROUTER_API_KEY": "sk-or-test"}
         assert any("ANTHROPIC_API_KEY" in w and "allowed_env_vars" in w for w in warnings)
+
+    def test_malformed_allowed_env_vars_fails_closed(self, tmp_path):
+        with mock.patch("subprocess.run", return_value=_make_ok_proc()):
+            secrets, warnings = vw.fetch_vaultwarden_secrets(
+                session=_FAKE_SESSION,
+                item_name="Hermes",
+                binary=Path("/usr/bin/bw"),
+                use_cache=False,
+                home_path=tmp_path,
+                allowed_env_vars={"not": "a list"},
+            )
+        assert secrets == {}
+        assert any("allowed_env_vars must be a list" in w for w in warnings)
 
     def test_blocklisted_env_vars_are_never_exported(self, tmp_path):
         item = {

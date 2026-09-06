@@ -97,6 +97,7 @@ def setup_parser(parser: argparse.ArgumentParser) -> None:
     setup.add_argument(
         "--override-existing",
         action="store_true",
+        default=None,
         help="Allow Vaultwarden values to overwrite existing env vars",
     )
     setup.set_defaults(func=cmd_setup)
@@ -222,8 +223,13 @@ def cmd_setup(args: argparse.Namespace) -> int:
 
     session = ""
     if args.session_stdin:
-        stdin_value = sys.stdin.read().strip() if not sys.stdin.closed else ""
-        session = stdin_value.splitlines()[0].strip() if stdin_value else ""
+        session = sys.stdin.readline().strip() if not sys.stdin.closed else ""
+        extra_stdin = sys.stdin.read().strip() if not sys.stdin.closed else ""
+        if extra_stdin:
+            console.print(
+                "  [yellow]warning:[/yellow] ignoring extra stdin after the "
+                "first session-token line"
+            )
         if not session:
             console.print("  [red]--session-stdin was set but stdin was empty.[/red]")
             return 1
@@ -329,6 +335,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
     # ------------------------------------------------------------------ test
     console.print()
     console.print("[bold]Step 5[/bold]  Test fetch")
+    discovered_env_vars: List[str] = []
     try:
         secrets, warnings = vw.fetch_vaultwarden_secrets(
             session=session,
@@ -339,6 +346,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
             password_env=password_env,
             notes_env=notes_env,
             allowed_env_vars=explicit_allowed_env_vars,
+            discovered_env_vars=discovered_env_vars,
         )
     except Exception as exc:  # noqa: BLE001
         console.print(f"  [red]✗ Fetch failed: {exc}[/red]")
@@ -371,7 +379,10 @@ def cmd_setup(args: argparse.Namespace) -> int:
     secrets_cfg["item_name"] = item_name
     secrets_cfg.setdefault("session_env", session_env)
     secrets_cfg.setdefault("cache_ttl_seconds", 0)
-    secrets_cfg["override_existing"] = bool(args.override_existing)
+    if args.override_existing is not None:
+        secrets_cfg["override_existing"] = True
+    else:
+        secrets_cfg.setdefault("override_existing", False)
 
     login_targets = {v for v in (username_env, password_env, notes_env) if v}
     if explicit_allowed_env_vars is not None:
@@ -382,16 +393,9 @@ def cmd_setup(args: argparse.Namespace) -> int:
             console.print(f"  [yellow]warning:[/yellow] {w}")
         allowed_env_vars = sorted(allowed_set or [])
     else:
-        allowed_env_vars, allowlist_warnings = vw.discover_vaultwarden_custom_field_names(
-            session=session,
-            item_name=item_name,
-            binary=binary,
-        )
-        for w in allowlist_warnings:
-            console.print(f"  [yellow]warning:[/yellow] {w}")
         allowed_env_vars = [
             key
-            for key in allowed_env_vars
+            for key in sorted(set(discovered_env_vars))
             if key != session_env and key not in login_targets
         ]
     secrets_cfg["allowed_env_vars"] = allowed_env_vars
@@ -451,7 +455,7 @@ def cmd_status(args: argparse.Namespace) -> int:
 
     binary = vw.find_bw(vw_cfg.get("binary_path"))
     login_bindings, binding_warnings = vw.resolve_login_bindings(vw_cfg)
-    _, allowlist_warnings = vw.normalize_allowed_env_vars(
+    allowed_set, allowlist_warnings = vw.normalize_allowed_env_vars(
         vw_cfg.get("allowed_env_vars")
     )
 
@@ -470,7 +474,6 @@ def cmd_status(args: argparse.Namespace) -> int:
     if allowed_cfg is None:
         allowed_display = "[dim](legacy all non-blocked)[/dim]"
     else:
-        allowed_set, _ = vw.normalize_allowed_env_vars(allowed_cfg)
         allowed_display = (
             ", ".join(sorted(allowed_set or []))
             or "[dim](deny all custom fields)[/dim]"

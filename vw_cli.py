@@ -224,12 +224,6 @@ def cmd_setup(args: argparse.Namespace) -> int:
     session = ""
     if args.session_stdin:
         session = sys.stdin.readline().strip() if not sys.stdin.closed else ""
-        extra_stdin = sys.stdin.read(1).strip() if not sys.stdin.closed else ""
-        if extra_stdin:
-            console.print(
-                "  [yellow]warning:[/yellow] ignoring extra stdin after the "
-                "first session-token line"
-            )
         if not session:
             console.print("  [red]--session-stdin was set but stdin was empty.[/red]")
             return 1
@@ -392,6 +386,13 @@ def cmd_setup(args: argparse.Namespace) -> int:
         for w in allowed_warnings:
             console.print(f"  [yellow]warning:[/yellow] {w}")
         allowed_env_vars = sorted(allowed_set or [])
+    elif "allowed_env_vars" in secrets_cfg:
+        allowed_cfg_set, allowed_cfg_warnings = vw.normalize_allowed_env_vars(
+            secrets_cfg.get("allowed_env_vars")
+        )
+        for w in allowed_cfg_warnings:
+            console.print(f"  [yellow]warning:[/yellow] {w}")
+        allowed_env_vars = sorted(allowed_cfg_set or [])
     else:
         allowed_env_vars = [
             key

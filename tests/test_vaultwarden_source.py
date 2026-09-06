@@ -220,6 +220,49 @@ class TestCliHardening:
         assert vw_cfg["override_existing"] is False
         assert vw_cfg["allowed_env_vars"] == ["SAFE_API_KEY"]
 
+    def test_setup_session_stdin_reads_only_first_line(self, monkeypatch):
+        class SingleLineStdin:
+            closed = False
+
+            def isatty(self):
+                return False
+
+            def readline(self):
+                return "fresh-session\n"
+
+            def read(self, _size=-1):
+                raise AssertionError("cmd_setup must not read beyond first stdin line")
+
+        saved_config = {}
+        monkeypatch.setattr(vw_cli.sys, "stdin", SingleLineStdin())
+        monkeypatch.setattr(vw_cli.vw, "find_bw", lambda: Path("/usr/bin/bw"))
+        monkeypatch.setattr(vw_cli, "_bw_version", lambda _binary: "test")
+        monkeypatch.setattr(vw_cli, "_bw_current_server", lambda _binary: "")
+        monkeypatch.setattr(vw_cli, "load_config", lambda: {})
+        monkeypatch.setattr(vw_cli, "save_config", lambda cfg: saved_config.update(cfg))
+        monkeypatch.setattr(vw_cli, "save_env_value", mock.Mock())
+        monkeypatch.setattr(
+            vw_cli.vw,
+            "fetch_vaultwarden_secrets",
+            lambda **_kwargs: ({"SAFE_API_KEY": "safe"}, []),
+        )
+
+        args = argparse.Namespace(
+            session_stdin=True,
+            item_name="Hermes",
+            server_url=None,
+            username_env=None,
+            password_env=None,
+            notes_env=None,
+            allowed_env_vars=None,
+            override_existing=None,
+        )
+
+        assert vw_cli.cmd_setup(args) == 0
+        assert saved_config["secrets"]["vaultwarden"]["allowed_env_vars"] == [
+            "SAFE_API_KEY"
+        ]
+
     def test_setup_persists_explicit_allow_env_values(self, monkeypatch):
         class NonTtyStringIO(io.StringIO):
             def isatty(self):
@@ -254,6 +297,44 @@ class TestCliHardening:
         assert vw_cli.cmd_setup(args) == 0
         vw_cfg = saved_config["secrets"]["vaultwarden"]
         assert vw_cfg["allowed_env_vars"] == ["OTHER_KEY", "SAFE_API_KEY"]
+
+    def test_setup_preserves_existing_allowlist_without_flag(self, monkeypatch):
+        class NonTtyStringIO(io.StringIO):
+            def isatty(self):
+                return False
+
+        saved_config = {
+            "secrets": {"vaultwarden": {"allowed_env_vars": ["SAFE_API_KEY"]}}
+        }
+        monkeypatch.setenv("BW_SESSION", _FAKE_SESSION)
+        monkeypatch.setattr(vw_cli.sys, "stdin", NonTtyStringIO(""))
+        monkeypatch.setattr(vw_cli.vw, "find_bw", lambda: Path("/usr/bin/bw"))
+        monkeypatch.setattr(vw_cli, "_bw_version", lambda _binary: "test")
+        monkeypatch.setattr(vw_cli, "_bw_current_server", lambda _binary: "")
+        monkeypatch.setattr(vw_cli, "load_config", lambda: saved_config)
+        monkeypatch.setattr(vw_cli, "save_config", lambda cfg: saved_config.update(cfg))
+        monkeypatch.setattr(vw_cli, "save_env_value", mock.Mock())
+
+        def fake_fetch(**kwargs):
+            kwargs["discovered_env_vars"].extend(["SAFE_API_KEY", "NEW_API_KEY"])
+            return {"SAFE_API_KEY": "safe", "NEW_API_KEY": "new"}, []
+
+        monkeypatch.setattr(vw_cli.vw, "fetch_vaultwarden_secrets", fake_fetch)
+
+        args = argparse.Namespace(
+            session_stdin=False,
+            item_name="Hermes",
+            server_url=None,
+            username_env=None,
+            password_env=None,
+            notes_env=None,
+            allowed_env_vars=None,
+            override_existing=None,
+        )
+
+        assert vw_cli.cmd_setup(args) == 0
+        vw_cfg = saved_config["secrets"]["vaultwarden"]
+        assert vw_cfg["allowed_env_vars"] == ["SAFE_API_KEY"]
 
     def test_sync_passes_configured_allowed_env_vars(self, monkeypatch):
         fetch = mock.Mock(return_value=({"SAFE_API_KEY": "safe"}, []))
@@ -338,6 +419,7 @@ class TestFetchVaultwardenSecrets:
                     "type": 1,
                 },
                 {"name": "HTTPS_PROXY", "value": "http://evil.invalid", "type": 1},
+                {"name": "HOME", "value": "/tmp/evil-home", "type": 1},
                 {"name": "SAFE_API_KEY", "value": "safe", "type": 1},
             ],
         }
@@ -353,6 +435,7 @@ class TestFetchVaultwardenSecrets:
         assert secrets == {"SAFE_API_KEY": "safe"}
         assert any("OPENAI_BASE_URL" in w and "blocked" in w for w in warnings)
         assert any("HTTPS_PROXY" in w and "blocked" in w for w in warnings)
+        assert any("HOME" in w and "blocked" in w for w in warnings)
 
     def test_child_env_is_minimal_and_session_not_in_argv(self, tmp_path):
         with mock.patch("subprocess.run", return_value=_make_ok_proc()) as mock_run:
